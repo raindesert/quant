@@ -1,0 +1,11 @@
+market: cn
+default_symbol: "000001.SZ"
+initial_cash: 1000000
+
+backtest:
+  start_date: "20230101"
+  end_date: "20231231"
+  commission: 0.0003
+
+data:
+  fetch_interval: 60
