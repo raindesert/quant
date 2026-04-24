@@ -117,7 +117,7 @@ def run_backtest(args, config, logger):
                 engine = BacktestEngine(
                     initial_cash=initial_cash,
                     commission=commission,
-                    verbose=False,
+                    verbose=verbose,
                 )
                 summary = engine.run(
                     get_strategy(current_strategy_name),
@@ -148,8 +148,6 @@ def run_backtest(args, config, logger):
             all_results.append(
                 {
                     "symbol": symbol,
-                    "best_strategy": strategy_results[0]["strategy"],
-                    "best_profit": strategy_results[0]["profit_pct"],
                     "results": strategy_results,
                 }
             )
@@ -157,14 +155,40 @@ def run_backtest(args, config, logger):
         print(f"\n{'=' * 60}")
         print("策略对比汇总")
         print(f"{'=' * 60}")
-        print(f"{'股票':<15s} {'最佳策略':<15s} {'收益率':>10s}")
-        print("-" * 45)
+
+        # 表头：股票 + 所有策略
+        header = f"{'股票':<15s}"
+        for s in strategy_names:
+            header += f"{s:>12s}"
+        print(header)
+        print("-" * (15 + 12 * len(strategy_names)))
+
+        # 每行：股票 + 各策略收益率
         for result in all_results:
-            print(
-                f"{result['symbol']:<15s} "
-                f"{result['best_strategy']:<15s} "
-                f"{result['best_profit']:+10.2f}%"
-            )
+            row = f"{result['symbol']:<15s}"
+            results_map = {r["strategy"]: r for r in result["results"]}
+            for s in strategy_names:
+                if s in results_map:
+                    row += f"{results_map[s]['profit_pct']:+12.2f}%"
+                else:
+                    row += f"{'N/A':>12s}"
+            print(row)
+
+        # 打印详细统计
+        print(f"\n{'=' * 60}")
+        print("各策略胜率统计")
+        print(f"{'=' * 60}")
+        for s in strategy_names:
+            profits = []
+            for r in all_results:
+                for x in r["results"]:
+                    if x["strategy"] == s:
+                        profits.append(x["profit_pct"])
+                        break
+            if profits:
+                avg = sum(profits) / len(profits)
+                wins = sum(1 for p in profits if p > 0)
+                print(f"{s:<15s}: 平均收益 {avg:+7.2f}%, 胜率 {wins}/{len(profits)}")
         return
 
     results = []
