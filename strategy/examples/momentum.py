@@ -13,11 +13,11 @@ class MomentumStrategy(BaseStrategy):
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])
-        if len(self.prices) < self.period + 1:
+        if len(self.prices) < self.period:
             return Signal.HOLD
 
         # 计算动量 (期间收益率)
-        momentum = (self.prices[-1] - self.prices[-self.period-1]) / self.prices[-self.period-1]
+        momentum = (self.prices[-1] - self.prices[-self.period]) / self.prices[-self.period]
 
         position = self.get_position(bar["symbol"])
 

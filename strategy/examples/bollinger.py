@@ -18,7 +18,12 @@ class BollingerStrategy(BaseStrategy):
 
         recent_prices = self.prices[-self.period:]
         mid = sum(recent_prices) / self.period
-        std = (sum((p - mid) ** 2 for p in recent_prices) / self.period) ** 0.5
+        # 使用样本标准差 (N-1)，与 pandas rolling().std() 默认行为一致
+        if self.period < 2:
+            std = 0.0
+        else:
+            variance = sum((p - mid) ** 2 for p in recent_prices) / (self.period - 1)
+            std = variance ** 0.5
         upper = mid + self.std_dev * std
         lower = mid - self.std_dev * std
 

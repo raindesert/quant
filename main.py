@@ -92,9 +92,14 @@ def print_batch_summary(results: list[dict], initial_cash: float):
 
 def run_backtest(args, config, logger):
     """运行回测。"""
-    days = args.days or config.get("backtest", {}).get("days", 250)
+    backtest_config = config.get("backtest", {})
+    days = args.days or backtest_config.get("days", 250)
     initial_cash = config.get("initial_cash", 1_000_000)
-    commission = config.get("backtest", {}).get("commission", 0.0003)
+    commission = backtest_config.get("commission", 0.0003)
+    stop_loss = args.stop_loss if args.stop_loss is not None else backtest_config.get("stop_loss", 0.0)
+    position_size = args.position_size if args.position_size is not None else backtest_config.get("position_size", 1.0)
+    start_date = backtest_config.get("start_date")
+    end_date = backtest_config.get("end_date")
 
     symbols = resolve_symbols(args, config, logger)
     if not symbols:
@@ -118,11 +123,15 @@ def run_backtest(args, config, logger):
                     initial_cash=initial_cash,
                     commission=commission,
                     verbose=verbose,
+                    stop_loss=stop_loss,
+                    position_size=position_size,
                 )
                 summary = engine.run(
                     get_strategy(current_strategy_name),
                     symbol,
                     days=days,
+                    start_date=start_date,
+                    end_date=end_date,
                 )
                 if summary is None:
                     continue
@@ -203,8 +212,16 @@ def run_backtest(args, config, logger):
             initial_cash=initial_cash,
             commission=commission,
             verbose=verbose,
+            stop_loss=stop_loss,
+            position_size=position_size,
         )
-        summary = engine.run(get_strategy(strategy_name), symbol, days=days)
+        summary = engine.run(
+            get_strategy(strategy_name),
+            symbol,
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+        )
         if summary is None:
             continue
 
@@ -312,6 +329,8 @@ def main():
     parser.add_argument("--days", type=int, default=None, help="回测天数，默认使用配置值")
     parser.add_argument("--verbose", action="store_true", help="显示交易明细")
     parser.add_argument("--all-strategies", action="store_true", help="测试所有策略并对比")
+    parser.add_argument("--stop-loss", type=float, default=None, help="止损比例 (如 0.05 表示 5%%)")
+    parser.add_argument("--position-size", type=float, default=None, help="仓位比例 0.0~1.0 (默认 1.0)")
 
     args = parser.parse_args()
     logger = setup_logger()
