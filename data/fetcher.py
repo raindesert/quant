@@ -1,6 +1,8 @@
 """行情数据获取模块。"""
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -14,14 +16,16 @@ try:
 except ImportError:
     BAOSTOCK_AVAILABLE = False
 
+logger = logging.getLogger("quant")
+
 
 class DataFetcher:
     """获取历史行情与实时行情。"""
 
-    _history_cache: dict[str, pd.DataFrame] = {}
+    _history_cache: dict[str, tuple[pd.DataFrame, float]] = {}
+    _CACHE_TTL = 3600
 
     def __init__(self):
-        self.cache = self._history_cache
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -32,7 +36,6 @@ class DataFetcher:
 
     @staticmethod
     def _to_tencent_symbol(symbol: str) -> str:
-        """将 000001.SZ 这类代码转为腾讯接口格式。"""
         parts = symbol.split(".")
         if len(parts) == 2:
             code, exchange = parts
@@ -42,7 +45,6 @@ class DataFetcher:
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:
-        """将 000001.SZ 这类代码转为 baostock 格式。"""
         parts = symbol.split(".")
         if len(parts) == 2:
             code, exchange = parts
@@ -51,39 +53,38 @@ class DataFetcher:
         return symbol
 
     def get_history(self, symbol: str, days: int = 250) -> pd.DataFrame:
-        """获取历史日线数据。优先 baostock，腾讯作为降级方案。"""
         if days <= 0:
             raise ValueError("days 必须大于 0")
 
         cache_key = f"{symbol}_{days}"
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            return cached.copy()
+        now = time.time()
+        cached_entry = self._history_cache.get(cache_key)
+        if cached_entry is not None:
+            cached_df, cached_time = cached_entry
+            if now - cached_time < self._CACHE_TTL:
+                return cached_df.copy()
 
-        # 优先：baostock
         if BAOSTOCK_AVAILABLE:
             try:
                 df = self._fetch_from_baostock(symbol, days)
                 if not df.empty and len(df) >= days * 0.6:
-                    self.cache[cache_key] = df.copy()
+                    self._history_cache[cache_key] = (df.copy(), now)
                     return df
             except Exception as exc:
-                print(f"baostock获取失败: {exc}")
+                logger.warning("baostock获取失败: %s", exc)
 
-        # 降级：腾讯财经
         tx_symbol = self._to_tencent_symbol(symbol)
         try:
             df = self._fetch_from_tencent(tx_symbol, days)
             if not df.empty and len(df) >= days * 0.7:
-                self.cache[cache_key] = df.copy()
+                self._history_cache[cache_key] = (df.copy(), now)
                 return df
         except Exception as exc:
-            print(f"腾讯API获取失败: {exc}")
+            logger.warning("腾讯API获取失败: %s", exc)
 
         raise RuntimeError(f"无法获取 {symbol} 历史数据，所有数据源均失败")
 
     def _fetch_from_baostock(self, symbol: str, days: int) -> pd.DataFrame:
-        """从 baostock 获取历史日线。"""
         bs.login()
         try:
             code = self._to_baostock_code(symbol)
@@ -96,7 +97,7 @@ class DataFetcher:
                 start_date=start_date,
                 end_date=end_date,
                 frequency="d",
-                adjustflag="2",  # 前复权
+                adjustflag="2",
             )
             if rs.error_code != "0":
                 raise RuntimeError(f"baostock error: {rs.error_msg}")
@@ -118,7 +119,6 @@ class DataFetcher:
             bs.logout()
 
     def _fetch_from_tencent(self, symbol: str, days: int) -> pd.DataFrame:
-        """从腾讯财经接口获取历史日线。"""
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         params = {"param": f"{symbol},day,{start_date},{end_date},{days},qfq"}
@@ -156,7 +156,6 @@ class DataFetcher:
         return df.dropna().sort_values("date").reset_index(drop=True)
 
     def get_realtime(self, symbol: str) -> Optional[dict]:
-        """获取实时行情。"""
         tx_symbol = self._to_tencent_symbol(symbol)
 
         try:
@@ -188,11 +187,10 @@ class DataFetcher:
                 "timestamp": current_time,
             }
         except Exception as exc:
-            print(f"获取 {symbol} 实时数据失败: {exc}")
+            logger.warning("获取 %s 实时数据失败: %s", symbol, exc)
             return None
 
     def get_realtime_batch(self, symbols: list[str]) -> dict[str, dict]:
-        """批量获取实时行情。"""
         result = {}
         for symbol in symbols:
             data = self.get_realtime(symbol)

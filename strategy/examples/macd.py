@@ -10,15 +10,14 @@ class MACDStrategy(BaseStrategy):
         self.fast = fast
         self.slow = slow
         self.signal = signal
-        self.prices = []
         self.fast_ema = None
         self.slow_ema = None
         self.signal_ema = None
         self.prev_macd = None
+        self._bar_count = 0
 
     @staticmethod
     def _next_ema(previous: float | None, price: float, period: int) -> float:
-        """增量计算 EMA。"""
         if previous is None:
             return price
         alpha = 2 / (period + 1)
@@ -26,8 +25,10 @@ class MACDStrategy(BaseStrategy):
 
     def on_bar(self, bar: dict) -> str:
         price = bar["close"]
-        self.prices.append(price)
-        if len(self.prices) < self.slow:
+        self._bar_count += 1
+        if self._bar_count < self.slow:
+            self.fast_ema = self._next_ema(self.fast_ema, price, self.fast)
+            self.slow_ema = self._next_ema(self.slow_ema, price, self.slow)
             return Signal.HOLD
 
         self.fast_ema = self._next_ema(self.fast_ema, price, self.fast)
@@ -50,3 +51,11 @@ class MACDStrategy(BaseStrategy):
 
         self.prev_macd = macd
         return current_signal
+
+    def reset(self):
+        super().reset()
+        self.fast_ema = None
+        self.slow_ema = None
+        self.signal_ema = None
+        self.prev_macd = None
+        self._bar_count = 0

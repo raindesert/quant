@@ -13,12 +13,14 @@ class BollingerStrategy(BaseStrategy):
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])
+        if len(self.prices) > self.period + 1:
+            self.prices = self.prices[-self.period:]
+
         if len(self.prices) < self.period:
             return Signal.HOLD
 
         recent_prices = self.prices[-self.period:]
         mid = sum(recent_prices) / self.period
-        # 使用样本标准差 (N-1)，与 pandas rolling().std() 默认行为一致
         if self.period < 2:
             std = 0.0
         else:
@@ -30,11 +32,13 @@ class BollingerStrategy(BaseStrategy):
         position = self.get_position(bar["symbol"])
         current_price = bar["close"]
 
-        # 价格突破下轨买入
         if current_price < lower and position == 0:
             return Signal.BUY
-        # 价格突破上轨卖出
         elif current_price > upper and position > 0:
             return Signal.SELL
 
         return Signal.HOLD
+
+    def reset(self):
+        super().reset()
+        self.prices = []

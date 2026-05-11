@@ -5,14 +5,20 @@ from strategy.base import BaseStrategy, Signal
 class SMAStrategy(BaseStrategy):
     """简单移动平均线策略 - 金叉买入，死叉卖出"""
 
+    MAX_PRICES = 0
+
     def __init__(self, fast: int = 5, slow: int = 20):
         super().__init__("SMA")
         self.fast = fast
         self.slow = slow
+        self.MAX_PRICES = slow + 2
         self.prices = []
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])
+        if len(self.prices) > self.MAX_PRICES:
+            self.prices = self.prices[-(self.slow + 1):]
+
         if len(self.prices) < self.slow + 1:
             return Signal.HOLD
 
@@ -31,3 +37,7 @@ class SMAStrategy(BaseStrategy):
                 return Signal.SELL
 
         return Signal.HOLD
+
+    def reset(self):
+        super().reset()
+        self.prices = []

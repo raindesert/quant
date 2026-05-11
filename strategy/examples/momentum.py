@@ -8,24 +8,28 @@ class MomentumStrategy(BaseStrategy):
     def __init__(self, period: int = 20, threshold: float = 0.02):
         super().__init__("Momentum")
         self.period = period
-        self.threshold = threshold  # 动量阈值 2%
+        self.threshold = threshold
         self.prices = []
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])
-        if len(self.prices) < self.period:
+        if len(self.prices) > self.period + 1:
+            self.prices = self.prices[-(self.period + 1):]
+
+        if len(self.prices) < self.period + 1:
             return Signal.HOLD
 
-        # 计算动量 (期间收益率)
         momentum = (self.prices[-1] - self.prices[-self.period]) / self.prices[-self.period]
 
         position = self.get_position(bar["symbol"])
 
-        # 动量大于阈值且无持仓，买入
         if momentum > self.threshold and position == 0:
             return Signal.BUY
-        # 动量小于负阈值且有持仓，卖出
         elif momentum < -self.threshold and position > 0:
             return Signal.SELL
 
         return Signal.HOLD
+
+    def reset(self):
+        super().reset()
+        self.prices = []

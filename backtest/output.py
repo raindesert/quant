@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import pandas as pd
 
 # 中文字体支持 - 按优先级尝试可用字体
 plt.rcParams["font.sans-serif"] = [
@@ -56,16 +57,11 @@ def export_summary_json(summary: dict, equity_curve: list[dict], benchmark_curve
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 转换 Timestamp/datetime 为字符串
     def serialize(obj):
         if isinstance(obj, dict):
             return {k: serialize(v) for k, v in obj.items()}
         if isinstance(obj, list):
-            result = []
-            for i in obj:
-                result.append(serialize(i))
-            return result
-        import pandas as pd
+            return [serialize(i) for i in obj]
         if isinstance(obj, pd.Timestamp):
             return obj.strftime("%Y-%m-%d")
         if hasattr(obj, "strftime"):

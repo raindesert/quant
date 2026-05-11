@@ -8,11 +8,14 @@ class MeanReversionStrategy(BaseStrategy):
     def __init__(self, period: int = 20, threshold: float = 0.05):
         super().__init__("MeanReversion")
         self.period = period
-        self.threshold = threshold  # 偏离阈值 5%
+        self.threshold = threshold
         self.prices = []
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])
+        if len(self.prices) > self.period + 1:
+            self.prices = self.prices[-self.period:]
+
         if len(self.prices) < self.period:
             return Signal.HOLD
 
@@ -22,11 +25,13 @@ class MeanReversionStrategy(BaseStrategy):
 
         position = self.get_position(bar["symbol"])
 
-        # 价格严重低于均线，买入
         if deviation < -self.threshold and position == 0:
             return Signal.BUY
-        # 价格严重高于均线，卖出
         elif deviation > self.threshold and position > 0:
             return Signal.SELL
 
         return Signal.HOLD
+
+    def reset(self):
+        super().reset()
+        self.prices = []
