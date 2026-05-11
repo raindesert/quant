@@ -1,4 +1,4 @@
-"""行情数据获取模块。"""
+"""行情数据获取模块 — 支持本地SQLite缓存和增量更新。"""
 from __future__ import annotations
 
 import logging
@@ -16,16 +16,18 @@ try:
 except ImportError:
     BAOSTOCK_AVAILABLE = False
 
+from data.cache import DataCache
+
 logger = logging.getLogger("quant")
 
 
 class DataFetcher:
-    """获取历史行情与实时行情。"""
+    """获取历史行情与实时行情，支持本地SQLite缓存。"""
 
     _history_cache: dict[str, tuple[pd.DataFrame, float]] = {}
     _CACHE_TTL = 3600
 
-    def __init__(self):
+    def __init__(self, use_local_cache: bool = True):
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -33,6 +35,7 @@ class DataFetcher:
                 "Referer": "https://finance.qq.com/",
             }
         )
+        self._local_cache = DataCache() if use_local_cache else None
 
     @staticmethod
     def _to_tencent_symbol(symbol: str) -> str:
@@ -64,10 +67,19 @@ class DataFetcher:
             if now - cached_time < self._CACHE_TTL:
                 return cached_df.copy()
 
+        if self._local_cache is not None:
+            df = self._try_incremental_fetch(symbol, days)
+            if not df.empty and len(df) >= days * 0.6:
+                self._local_cache.save(symbol, df)
+                self._history_cache[cache_key] = (df.copy(), now)
+                return df
+
         if BAOSTOCK_AVAILABLE:
             try:
                 df = self._fetch_from_baostock(symbol, days)
                 if not df.empty and len(df) >= days * 0.6:
+                    if self._local_cache is not None:
+                        self._local_cache.save(symbol, df)
                     self._history_cache[cache_key] = (df.copy(), now)
                     return df
             except Exception as exc:
@@ -77,12 +89,63 @@ class DataFetcher:
         try:
             df = self._fetch_from_tencent(tx_symbol, days)
             if not df.empty and len(df) >= days * 0.7:
+                if self._local_cache is not None:
+                    self._local_cache.save(symbol, df)
                 self._history_cache[cache_key] = (df.copy(), now)
                 return df
         except Exception as exc:
             logger.warning("腾讯API获取失败: %s", exc)
 
+        if self._local_cache is not None:
+            df = self._local_cache.load(symbol)
+            if not df.empty:
+                logger.info("使用本地缓存数据: %s (%d条)", symbol, len(df))
+                cutoff = df["date"].max() - pd.Timedelta(days=days)
+                df = df[df["date"] >= cutoff].reset_index(drop=True)
+                self._history_cache[cache_key] = (df.copy(), now)
+                return df
+
         raise RuntimeError(f"无法获取 {symbol} 历史数据，所有数据源均失败")
+
+    def _try_incremental_fetch(self, symbol: str, days: int) -> pd.DataFrame:
+        last_date_str = self._local_cache.get_last_date(symbol)
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        if last_date_str is None:
+            return pd.DataFrame()
+
+        start_dt = datetime.now() - timedelta(days=days)
+        cached_df = self._local_cache.load(symbol, start_date=start_dt.strftime("%Y-%m-%d"))
+        if cached_df.empty:
+            return pd.DataFrame()
+
+        last_dt = pd.Timestamp(last_date_str)
+        if (datetime.now() - last_dt.to_pydatetime()).days <= 0:
+            return cached_df
+
+        incremental_days = (datetime.now() - last_dt.to_pydatetime()).days + 5
+        new_df = pd.DataFrame()
+
+        if BAOSTOCK_AVAILABLE:
+            try:
+                new_df = self._fetch_from_baostock(symbol, incremental_days)
+            except Exception:
+                pass
+
+        if new_df.empty:
+            try:
+                tx_symbol = self._to_tencent_symbol(symbol)
+                new_df = self._fetch_from_tencent(tx_symbol, incremental_days)
+            except Exception:
+                pass
+
+        if not new_df.empty:
+            combined = pd.concat([cached_df, new_df], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["date"], keep="last")
+            combined = combined.sort_values("date").reset_index(drop=True)
+            return combined
+
+        return cached_df
 
     def _fetch_from_baostock(self, symbol: str, days: int) -> pd.DataFrame:
         max_retries = 3

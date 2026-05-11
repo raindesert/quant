@@ -27,7 +27,7 @@ from utils.logger import setup_logger
 
 def _run_single_backtest(args_tuple):
     """独立函数，用于并发回测（必须是模块级以支持 pickle）。"""
-    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose = args_tuple
+    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit = args_tuple
     strategy_cls = STRATEGIES.get(strategy_name.lower())
     if strategy_cls is None:
         strategy_cls = SMAStrategy
@@ -35,10 +35,14 @@ def _run_single_backtest(args_tuple):
     engine = BacktestEngine(
         initial_cash=initial_cash,
         commission=commission,
-        verbose=False,  # 并发模式下关闭内部打印
+        verbose=False,
         stop_loss=stop_loss,
         take_profit=take_profit,
         position_size=position_size,
+        slippage=slippage,
+        slippage_type=slippage_type,
+        enforce_t_plus_1=enforce_t1,
+        check_limit=check_limit,
     )
     summary = engine.run(
         strategy,
@@ -158,6 +162,10 @@ def run_optimize(args, config, logger):
     stop_loss = args.stop_loss if args.stop_loss is not None else backtest_config.get("stop_loss", 0.0)
     take_profit = args.take_profit if args.take_profit is not None else backtest_config.get("take_profit", 0.0)
     position_size = args.position_size if args.position_size is not None else backtest_config.get("position_size", 1.0)
+    slippage = args.slippage if args.slippage is not None else backtest_config.get("slippage", 0.001)
+    slippage_type = args.slippage_type if args.slippage_type else backtest_config.get("slippage_type", "percent")
+    enforce_t1 = args.enforce_t1 if hasattr(args, "enforce_t1") else backtest_config.get("enforce_t_plus_1", True)
+    check_limit = args.check_limit if hasattr(args, "check_limit") else backtest_config.get("check_limit", True)
     start_date = backtest_config.get("start_date")
     end_date = backtest_config.get("end_date")
 
@@ -231,6 +239,10 @@ def run_portfolio(args, config, logger):
     stop_loss = args.stop_loss if args.stop_loss is not None else backtest_config.get("stop_loss", 0.0)
     take_profit = args.take_profit if args.take_profit is not None else backtest_config.get("take_profit", 0.0)
     max_positions = getattr(args, "max_positions", 5)
+    slippage = args.slippage if args.slippage is not None else backtest_config.get("slippage", 0.001)
+    slippage_type = args.slippage_type if args.slippage_type else backtest_config.get("slippage_type", "percent")
+    enforce_t1 = args.enforce_t1 if hasattr(args, "enforce_t1") else backtest_config.get("enforce_t_plus_1", True)
+    check_limit = args.check_limit if hasattr(args, "check_limit") else backtest_config.get("check_limit", True)
 
     symbols = resolve_symbols(args, config, logger)
     if not symbols:
@@ -253,6 +265,10 @@ def run_portfolio(args, config, logger):
         stop_loss=stop_loss,
         take_profit=take_profit,
         max_positions=max_positions,
+        slippage=slippage,
+        slippage_type=slippage_type,
+        enforce_t_plus_1=enforce_t1,
+        check_limit=check_limit,
     )
     summary = engine.run(make_strategy, symbols, days=days)
     if summary is None:
@@ -278,6 +294,10 @@ def run_backtest(args, config, logger):
     stop_loss = args.stop_loss if args.stop_loss is not None else backtest_config.get("stop_loss", 0.0)
     take_profit = args.take_profit if args.take_profit is not None else backtest_config.get("take_profit", 0.0)
     position_size = args.position_size if args.position_size is not None else backtest_config.get("position_size", 1.0)
+    slippage = args.slippage if args.slippage is not None else backtest_config.get("slippage", 0.001)
+    slippage_type = args.slippage_type if args.slippage_type else backtest_config.get("slippage_type", "percent")
+    enforce_t1 = args.enforce_t1 if hasattr(args, "enforce_t1") else backtest_config.get("enforce_t_plus_1", True)
+    check_limit = args.check_limit if hasattr(args, "check_limit") else backtest_config.get("check_limit", True)
     start_date = backtest_config.get("start_date")
     end_date = backtest_config.get("end_date")
     parallel = getattr(args, "parallel", True)
@@ -297,7 +317,7 @@ def run_backtest(args, config, logger):
         tasks = []
         for symbol in symbols:
             for s in strategy_names:
-                tasks.append((s, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose))
+                tasks.append((s, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit))
 
         print(f"\n{'=' * 60}")
         print(f"批量回测: {len(symbols)} 只股票 x {len(strategy_names)} 种策略 = {len(tasks)} 个任务 (并发执行)")
@@ -405,7 +425,7 @@ def run_backtest(args, config, logger):
         print(f"批量回测: {len(symbols)} 只股票 (并发执行)")
         print(f"{'=' * 50}")
         t0 = time.time()
-        tasks = [(strategy_name, s, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose) for s in symbols]
+        tasks = [(strategy_name, s, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit) for s in symbols]
         with ProcessPoolExecutor(max_workers=min(8, len(symbols))) as executor:
             futures = [executor.submit(_run_single_backtest, t) for t in tasks]
             for future in as_completed(futures):
@@ -432,6 +452,10 @@ def run_backtest(args, config, logger):
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 position_size=position_size,
+                slippage=slippage,
+                slippage_type=slippage_type,
+                enforce_t_plus_1=enforce_t1,
+                check_limit=check_limit,
             )
             summary = engine.run(
                 get_strategy(strategy_name),
@@ -559,6 +583,10 @@ def main():
     parser.add_argument("--stop-loss", type=float, default=None, help="止损比例 (如 0.05 表示 5%%)")
     parser.add_argument("--take-profit", type=float, default=None, help="止盈比例 (如 0.10 表示 10%%)")
     parser.add_argument("--position-size", type=float, default=None, help="仓位比例 0.0~1.0 (默认 1.0)")
+    parser.add_argument("--slippage", type=float, default=None, help="滑点比例 (如0.001=0.1%%) 或固定金额")
+    parser.add_argument("--slippage-type", choices=["percent", "fixed"], default="percent", help="滑点类型: percent(百分比) 或 fixed(固定金额)")
+    parser.add_argument("--no-t1", dest="enforce_t1", action="store_false", help="禁用T+1约束（允许当日买卖）")
+    parser.add_argument("--no-limit", dest="check_limit", action="store_false", help="禁用涨跌停判断")
     parser.add_argument("--no-parallel", dest="parallel", action="store_false", help="禁用并发批量回测")
     parser.add_argument("--output-json", metavar="PATH", help="导出回测结果为 JSON 文件")
     parser.add_argument("--output-csv", metavar="PATH", help="导出交易记录为 CSV 文件")

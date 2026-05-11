@@ -4,11 +4,16 @@ from __future__ import annotations
 import math
 from strategy.base import Signal
 
+LIMIT_UP_THRESHOLD_ST = 0.05
+LIMIT_UP_THRESHOLD_MAIN = 0.10
+LIMIT_UP_THRESHOLD_NEW = 0.20
+
 
 class BaseBacktestEngine:
     """回测引擎公共基类。
 
     提供账户管理、指标计算、止损止盈检查等共享功能。
+    支持: T+1约束、滑点模型、涨跌停判断。
     """
 
     TRADING_DAYS_PER_YEAR = 244
@@ -23,6 +28,10 @@ class BaseBacktestEngine:
         take_profit: float = 0.0,
         stamp_tax: float = 0.001,
         min_commission: float = 5.0,
+        slippage: float = 0.0,
+        slippage_type: str = "percent",
+        enforce_t_plus_1: bool = True,
+        check_limit: bool = True,
     ):
         self.initial_cash = initial_cash
         self.commission = commission
@@ -31,16 +40,22 @@ class BaseBacktestEngine:
         self.take_profit = take_profit
         self.stamp_tax = stamp_tax
         self.min_commission = min_commission
+        self.slippage = slippage
+        self.slippage_type = slippage_type
+        self.enforce_t_plus_1 = enforce_t_plus_1
+        self.check_limit = check_limit
         self.reset()
 
     def reset(self):
         self.cash = self.initial_cash
         self.positions = {}
         self.entry_prices = {}
+        self.entry_dates = {}
         self.trades = []
         self.equity_curve = []
         self.benchmark_curve = []
         self.last_prices = {}
+        self.last_bars = {}
         self.pending_signal = {}
         self._last_action = None
 
@@ -57,6 +72,62 @@ class BaseBacktestEngine:
             "last_price": row.close,
             "volume": row.volume,
         }
+
+    def _apply_slippage(self, price: float, direction: str) -> float:
+        if self.slippage <= 0:
+            return price
+        if self.slippage_type == "fixed":
+            return price + self.slippage if direction == "buy" else price - self.slippage
+        slip_amount = price * self.slippage
+        return price + slip_amount if direction == "buy" else max(price - slip_amount, 0.01)
+
+    def _is_limit_up(self, symbol: str, bar: dict) -> bool:
+        if not self.check_limit:
+            return False
+        prev_close = self._get_prev_close(symbol)
+        if prev_close is None or prev_close <= 0:
+            return False
+        threshold = self._get_limit_threshold(symbol)
+        return bar["close"] >= prev_close * (1 + threshold - 0.001)
+
+    def _is_limit_down(self, symbol: str, bar: dict) -> bool:
+        if not self.check_limit:
+            return False
+        prev_close = self._get_prev_close(symbol)
+        if prev_close is None or prev_close <= 0:
+            return False
+        threshold = self._get_limit_threshold(symbol)
+        return bar["close"] <= prev_close * (1 - threshold + 0.001)
+
+    def _get_prev_close(self, symbol: str) -> float | None:
+        last_bar = self.last_bars.get(symbol)
+        if last_bar is not None:
+            return last_bar.get("close")
+        return None
+
+    @staticmethod
+    def _get_limit_threshold(symbol: str) -> float:
+        code = symbol.split(".")[0] if "." in symbol else symbol
+        if code.startswith("688"):
+            return LIMIT_UP_THRESHOLD_NEW
+        if code.startswith("300") or code.startswith("301"):
+            return LIMIT_UP_THRESHOLD_NEW
+        if code.startswith("00"):
+            return LIMIT_UP_THRESHOLD_MAIN
+        if code.startswith("60"):
+            return LIMIT_UP_THRESHOLD_MAIN
+        return LIMIT_UP_THRESHOLD_MAIN
+
+    def _check_t_plus_1(self, symbol: str, current_date) -> bool:
+        if not self.enforce_t_plus_1:
+            return True
+        entry_date = self.entry_dates.get(symbol)
+        if entry_date is None:
+            return True
+        try:
+            return (current_date - entry_date).days >= 1
+        except Exception:
+            return True
 
     def _calc_buy_cost(self, price: float, quantity: int) -> float:
         commission = max(price * quantity * self.commission, self.min_commission)
@@ -155,9 +226,12 @@ class BaseBacktestEngine:
         total_loss = 0.0
         total_commission = 0.0
         total_stamp_tax = 0.0
+        total_slippage_cost = 0.0
         for t in self.trades:
             cc = t.get("commission_cost", 0.0)
             total_commission += cc
+            sc = t.get("slippage_cost", 0.0)
+            total_slippage_cost += sc
             if t["action"] == "SELL":
                 stamp = t["price"] * t["quantity"] * self.stamp_tax
                 total_stamp_tax += stamp
@@ -198,5 +272,6 @@ class BaseBacktestEngine:
             "profit_factor": profit_factor,
             "total_commission": total_commission,
             "total_stamp_tax": total_stamp_tax,
+            "total_slippage_cost": total_slippage_cost,
             "avg_holding_days": avg_holding_days,
         }

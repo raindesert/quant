@@ -25,6 +25,10 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
         stop_loss: float = 0.0,
         take_profit: float = 0.0,
         max_positions: int = 5,
+        slippage: float = 0.0,
+        slippage_type: str = "percent",
+        enforce_t_plus_1: bool = True,
+        check_limit: bool = True,
     ):
         super().__init__(
             initial_cash=initial_cash,
@@ -32,6 +36,10 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
             verbose=verbose,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            slippage=slippage,
+            slippage_type=slippage_type,
+            enforce_t_plus_1=enforce_t_plus_1,
+            check_limit=check_limit,
         )
         self.max_positions = max_positions
 
@@ -89,6 +97,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                     continue
                 bar = self._row_to_bar(row, sym)
                 self.last_prices[sym] = bar["close"]
+                self.last_bars[sym] = bar
                 strategies[sym].on_bar(bar)
 
         benchmark_shares = {sym: 0 for sym in symbol_data}
@@ -105,6 +114,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 bar = self._row_to_bar(row, symbol=sym)
                 bars[sym] = bar
                 self.last_prices[sym] = bar["close"]
+                self.last_bars[sym] = bar
 
                 if benchmark_shares[sym] == 0 and di == 0:
                     open_p = bar["open"]
@@ -191,6 +201,10 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
         lot_size = 100
 
         if signal == Signal.BUY:
+            if self._is_limit_up(symbol, bar):
+                return
+
+            actual_price = self._apply_slippage(price, "buy")
             current_holdings = len(self.positions)
             if current_holdings >= self.max_positions and symbol not in self.positions:
                 return
@@ -199,11 +213,11 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 budget = self.cash * 0.5
             else:
                 budget = self.cash * 0.5 / (current_holdings + 1) if current_holdings < self.max_positions else 0
-            affordable = int(budget / (price * (1 + self.commission)) / lot_size) * lot_size
+            affordable = int(budget / (actual_price * (1 + self.commission)) / lot_size) * lot_size
             if affordable <= 0:
                 return
 
-            cost = self._calc_buy_cost(price, affordable)
+            cost = self._calc_buy_cost(actual_price, affordable)
             if cost > self.cash:
                 return
             self.cash -= cost
@@ -211,45 +225,58 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
             new_qty = old_qty + affordable
             self.positions[symbol] = new_qty
             if old_qty > 0:
-                old_entry = self.entry_prices.get(symbol, price)
-                self.entry_prices[symbol] = (old_entry * old_qty + price * affordable) / new_qty
+                old_entry = self.entry_prices.get(symbol, actual_price)
+                self.entry_prices[symbol] = (old_entry * old_qty + actual_price * affordable) / new_qty
             else:
-                self.entry_prices[symbol] = price
+                self.entry_prices[symbol] = actual_price
+                self.entry_dates[symbol] = bar["date"]
             strategy.set_position(symbol, new_qty)
-            commission_cost = max(price * affordable * self.commission, self.min_commission)
+            commission_cost = max(actual_price * affordable * self.commission, self.min_commission)
+            slippage_cost = (actual_price - price) * affordable
             self.trades.append({
                 "date": bar["date"],
                 "symbol": symbol,
                 "action": "BUY",
-                "price": price,
+                "price": actual_price,
                 "quantity": affordable,
                 "entry_price": self.entry_prices[symbol],
                 "commission_cost": commission_cost,
+                "slippage_cost": slippage_cost,
             })
             if self.verbose:
-                print(f"  [{bar['date']}] BUY {symbol}: {affordable} @ {price:.2f}")
+                print(f"  [{bar['date']}] BUY {symbol}: {affordable} @ {actual_price:.2f}")
             return
 
         if signal == Signal.SELL and position > 0:
-            proceeds = self._calc_sell_proceeds(price, position)
-            commission_cost = max(price * position * self.commission, self.min_commission)
-            stamp_cost = price * position * self.stamp_tax
-            entry_price = self.entry_prices.get(symbol, price)
+            if not self._check_t_plus_1(symbol, bar["date"]):
+                return
+
+            if self._is_limit_down(symbol, bar):
+                return
+
+            actual_price = self._apply_slippage(price, "sell")
+            proceeds = self._calc_sell_proceeds(actual_price, position)
+            commission_cost = max(actual_price * position * self.commission, self.min_commission)
+            stamp_cost = actual_price * position * self.stamp_tax
+            entry_price = self.entry_prices.get(symbol, actual_price)
             self.cash += proceeds
             self.positions.pop(symbol, None)
             self.entry_prices.pop(symbol, None)
+            self.entry_dates.pop(symbol, None)
             strategy.set_position(symbol, 0)
+            slippage_cost = (price - actual_price) * position
             self.trades.append({
                 "date": bar["date"],
                 "symbol": symbol,
                 "action": "SELL",
-                "price": price,
+                "price": actual_price,
                 "quantity": position,
                 "entry_price": entry_price,
                 "commission_cost": commission_cost + stamp_cost,
+                "slippage_cost": slippage_cost,
             })
             if self.verbose:
-                print(f"  [{bar['date']}] SELL {symbol}: {position} @ {price:.2f}")
+                print(f"  [{bar['date']}] SELL {symbol}: {position} @ {actual_price:.2f}")
 
     def get_summary(self, symbols: list[str]) -> dict:
         final_value = self.get_total_value()
@@ -318,6 +345,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
         print(f"盈利因子: {summary.get('profit_factor', 0):.2f}")
         print(f"总佣金:   {summary.get('total_commission', 0):,.2f}")
         print(f"总印花税: {summary.get('total_stamp_tax', 0):,.2f}")
+        print(f"总滑点:   {summary.get('total_slippage_cost', 0):,.2f}")
         print(f"平均持仓: {summary.get('avg_holding_days', 0):.1f} 天")
         print(f"剩余现金: {summary.get('cash', 0):,.2f}")
         print(f"持仓: { {s: qty for s, qty in summary.get('positions', {}).items()} }")

@@ -27,6 +27,10 @@ class BacktestEngine(BaseBacktestEngine):
         stop_loss: float = 0.0,
         take_profit: float = 0.0,
         position_size: float = 1.0,
+        slippage: float = 0.0,
+        slippage_type: str = "percent",
+        enforce_t_plus_1: bool = True,
+        check_limit: bool = True,
     ):
         super().__init__(
             initial_cash=initial_cash,
@@ -34,6 +38,10 @@ class BacktestEngine(BaseBacktestEngine):
             verbose=verbose,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            slippage=slippage,
+            slippage_type=slippage_type,
+            enforce_t_plus_1=enforce_t_plus_1,
+            check_limit=check_limit,
         )
         self.position_size = position_size
 
@@ -84,6 +92,7 @@ class BacktestEngine(BaseBacktestEngine):
         for i, row in enumerate(bars[:warmup_count]):
             bar = self._row_to_bar(row, symbol)
             self.last_prices[symbol] = bar["close"]
+            self.last_bars[symbol] = bar
             strategy.on_bar(bar)
 
         for i in range(warmup_count, len(bars) - 1):
@@ -91,6 +100,7 @@ class BacktestEngine(BaseBacktestEngine):
             next_bar = self._row_to_bar(bars[i + 1], symbol)
 
             self.last_prices[symbol] = current_bar["close"]
+            self.last_bars[symbol] = current_bar
 
             if benchmark_shares == 0:
                 open_price = current_bar["open"]
@@ -145,13 +155,17 @@ class BacktestEngine(BaseBacktestEngine):
         position = self.positions.get(symbol, 0)
 
         if signal == Signal.BUY:
+            if self._is_limit_up(symbol, bar):
+                return
+
+            actual_price = self._apply_slippage(price, "buy")
             lot_size = 100
             available_cash = self.cash * self.position_size
-            affordable_quantity = int(available_cash / (price * (1 + self.commission)) / lot_size) * lot_size
+            affordable_quantity = int(available_cash / (actual_price * (1 + self.commission)) / lot_size) * lot_size
             if affordable_quantity <= 0:
                 return
 
-            cost = self._calc_buy_cost(price, affordable_quantity)
+            cost = self._calc_buy_cost(actual_price, affordable_quantity)
             if cost > self.cash:
                 return
             self.cash -= cost
@@ -159,20 +173,23 @@ class BacktestEngine(BaseBacktestEngine):
             new_qty = old_qty + affordable_quantity
             self.positions[symbol] = new_qty
             if old_qty > 0:
-                old_entry = self.entry_prices.get(symbol, price)
-                self.entry_prices[symbol] = (old_entry * old_qty + price * affordable_quantity) / new_qty
+                old_entry = self.entry_prices.get(symbol, actual_price)
+                self.entry_prices[symbol] = (old_entry * old_qty + actual_price * affordable_quantity) / new_qty
             else:
-                self.entry_prices[symbol] = price
+                self.entry_prices[symbol] = actual_price
+                self.entry_dates[symbol] = bar["date"]
             strategy.set_position(symbol, new_qty)
-            commission_cost = max(price * affordable_quantity * self.commission, self.min_commission)
+            commission_cost = max(actual_price * affordable_quantity * self.commission, self.min_commission)
+            slippage_cost = (actual_price - price) * affordable_quantity
             trade = {
                 "date": bar["date"],
                 "symbol": symbol,
                 "action": "BUY",
-                "price": price,
+                "price": actual_price,
                 "quantity": affordable_quantity,
                 "entry_price": self.entry_prices[symbol],
                 "commission_cost": commission_cost,
+                "slippage_cost": slippage_cost,
             }
             self.trades.append(trade)
             self._last_action = "buy"
@@ -181,22 +198,32 @@ class BacktestEngine(BaseBacktestEngine):
             return
 
         if signal == Signal.SELL and position > 0:
-            proceeds = self._calc_sell_proceeds(price, position)
-            commission_cost = max(price * position * self.commission, self.min_commission)
-            stamp_cost = price * position * self.stamp_tax
-            entry_price = self.entry_prices.get(symbol, price)
+            if not self._check_t_plus_1(symbol, bar["date"]):
+                return
+
+            if self._is_limit_down(symbol, bar):
+                return
+
+            actual_price = self._apply_slippage(price, "sell")
+            proceeds = self._calc_sell_proceeds(actual_price, position)
+            commission_cost = max(actual_price * position * self.commission, self.min_commission)
+            stamp_cost = actual_price * position * self.stamp_tax
+            entry_price = self.entry_prices.get(symbol, actual_price)
             self.cash += proceeds
             self.positions.pop(symbol, None)
             self.entry_prices.pop(symbol, None)
+            self.entry_dates.pop(symbol, None)
             strategy.set_position(symbol, 0)
+            slippage_cost = (price - actual_price) * position
             trade = {
                 "date": bar["date"],
                 "symbol": symbol,
                 "action": "SELL",
-                "price": price,
+                "price": actual_price,
                 "quantity": position,
                 "entry_price": entry_price,
                 "commission_cost": commission_cost + stamp_cost,
+                "slippage_cost": slippage_cost,
             }
             self.trades.append(trade)
             self._last_action = "sell"
@@ -272,6 +299,7 @@ class BacktestEngine(BaseBacktestEngine):
         print(f"盈利因子: {summary.get('profit_factor', 0):.2f}")
         print(f"总佣金:   {summary.get('total_commission', 0):,.2f}")
         print(f"总印花税: {summary.get('total_stamp_tax', 0):,.2f}")
+        print(f"总滑点:   {summary.get('total_slippage_cost', 0):,.2f}")
         print(f"平均持仓: {summary.get('avg_holding_days', 0):.1f} 天")
         print(f"剩余现金: {summary.get('cash', 0):,.2f}")
         print(f"持仓: {position_snapshot}")
