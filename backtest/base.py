@@ -153,6 +153,14 @@ class BaseBacktestEngine:
         win_trades = 0
         total_profit = 0.0
         total_loss = 0.0
+        total_commission = 0.0
+        total_stamp_tax = 0.0
+        for t in self.trades:
+            cc = t.get("commission_cost", 0.0)
+            total_commission += cc
+            if t["action"] == "SELL":
+                stamp = t["price"] * t["quantity"] * self.stamp_tax
+                total_stamp_tax += stamp
         for t in sell_trades:
             entry_price = t.get("entry_price", 0.0)
             pnl = (t["price"] - entry_price) * t["quantity"] - t.get("commission_cost", 0.0)
@@ -166,10 +174,29 @@ class BaseBacktestEngine:
         avg_win = total_profit / win_trades if win_trades else 0.0
         avg_loss = total_loss / (total - win_trades) if total and total > win_trades else 0.0
         profit_factor = total_profit / total_loss if total_loss > 0 else float("inf") if total_profit > 0 else 0.0
+
+        holding_days = []
+        buy_date_map = {}
+        for t in self.trades:
+            sym = t["symbol"]
+            if t["action"] == "BUY":
+                buy_date_map[sym] = t["date"]
+            elif t["action"] == "SELL" and sym in buy_date_map:
+                bd = buy_date_map.pop(sym)
+                try:
+                    delta = (t["date"] - bd).days
+                    holding_days.append(delta)
+                except Exception:
+                    pass
+        avg_holding_days = sum(holding_days) / len(holding_days) if holding_days else 0.0
+
         return {
             "trades": len(self.trades),
             "win_rate": win_rate,
             "avg_win": avg_win,
             "avg_loss": avg_loss,
             "profit_factor": profit_factor,
+            "total_commission": total_commission,
+            "total_stamp_tax": total_stamp_tax,
+            "avg_holding_days": avg_holding_days,
         }

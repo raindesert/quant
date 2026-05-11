@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -12,7 +11,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
 
-# 中文字体支持 - 按优先级尝试可用字体
 plt.rcParams["font.sans-serif"] = [
     "Microsoft YaHei",
     "SimHei",
@@ -21,6 +19,16 @@ plt.rcParams["font.sans-serif"] = [
     "DejaVu Sans",
 ]
 plt.rcParams["axes.unicode_minus"] = False
+
+_COLORS = {
+    "strategy": "#2196F3",
+    "benchmark": "#9E9E9E",
+    "buy": "#4CAF50",
+    "sell": "#F44336",
+    "drawdown": "#F44336",
+    "grid": "#BDBDBD",
+    "bg": "#FAFAFA",
+}
 
 
 def export_trades_csv(trades: list[dict], path: str | Path):
@@ -53,7 +61,6 @@ def export_trades_csv(trades: list[dict], path: str | Path):
 
 
 def export_summary_json(summary: dict, equity_curve: list[dict], benchmark_curve: list[dict], path: str | Path):
-    """将回测汇总和曲线数据导出为 JSON 文件。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -75,7 +82,6 @@ def export_summary_json(summary: dict, equity_curve: list[dict], benchmark_curve
     }
 
     def json_fallback(obj):
-        """处理无法序列化的对象（Timestamp等），降级为字符串"""
         try:
             return obj.strftime("%Y-%m-%d")
         except Exception:
@@ -87,14 +93,28 @@ def export_summary_json(summary: dict, equity_curve: list[dict], benchmark_curve
     print(f"回测结果已导出: {path}")
 
 
+def _find_max_drawdown_point(values: list[float]) -> tuple[int, float]:
+    peak = values[0]
+    max_dd_idx = 0
+    max_dd = 0.0
+    for i, v in enumerate(values):
+        if v > peak:
+            peak = v
+        dd = (peak - v) / peak * 100 if peak > 0 else 0
+        if dd > max_dd:
+            max_dd = dd
+            max_dd_idx = i
+    return max_dd_idx, max_dd
+
+
 def plot_equity_curve(
     equity_curve: list[dict],
     benchmark_curve: list[dict],
     symbol: str,
     output_path: str | Path,
     title: str | None = None,
+    summary: dict | None = None,
 ):
-    """绘制并保存权益曲线对比图（策略 vs 基准）。"""
     if not equity_curve:
         print("无可用权益数据，跳过绘图")
         return
@@ -102,48 +122,73 @@ def plot_equity_curve(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 提取数据
     dates = [e["date"] for e in equity_curve]
     values = [e["value"] for e in equity_curve]
     bm_dates = [b["date"] for b in benchmark_curve] if benchmark_curve else []
     bm_values = [b["value"] for b in benchmark_curve] if benchmark_curve else []
 
-    # 计算归一化（从 1 开始，方便对比）
     start_value = values[0]
     norm_values = [v / start_value * 100 for v in values]
     norm_bm = [v / bm_values[0] * 100 for v in bm_values] if bm_values and bm_values[0] > 0 else []
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 7), facecolor=_COLORS["bg"])
+    ax.set_facecolor(_COLORS["bg"])
 
-    ax.plot(dates, norm_values, label="策略", color="#2196F3", linewidth=1.5)
+    ax.plot(dates, norm_values, label="策略", color=_COLORS["strategy"], linewidth=1.8)
     if norm_bm:
-        ax.plot(bm_dates, norm_bm, label="基准 (买入持有)", color="#9E9E9E", linewidth=1.2, linestyle="--")
+        ax.plot(bm_dates, norm_bm, label="基准 (买入持有)", color=_COLORS["benchmark"], linewidth=1.2, linestyle="--")
 
-    # 标记买卖点
     buy_dates = [e["date"] for e in equity_curve if e.get("action") == "buy"]
     buy_values = [e["value"] / start_value * 100 for e in equity_curve if e.get("action") == "buy"]
     if buy_dates:
-        ax.scatter(buy_dates, buy_values, marker="^", color="#4CAF50", s=40, label="买入", zorder=5)
+        ax.scatter(buy_dates, buy_values, marker="^", color=_COLORS["buy"], s=50, label="买入", zorder=5, edgecolors="white", linewidths=0.5)
 
     sell_dates = [e["date"] for e in equity_curve if e.get("action") == "sell"]
     sell_values = [e["value"] / start_value * 100 for e in equity_curve if e.get("action") == "sell"]
     if sell_dates:
-        ax.scatter(sell_dates, sell_values, marker="v", color="#F44336", s=40, label="卖出", zorder=5)
+        ax.scatter(sell_dates, sell_values, marker="v", color=_COLORS["sell"], s=50, label="卖出", zorder=5, edgecolors="white", linewidths=0.5)
 
-    ax.axhline(y=100, color="#BDBDBD", linestyle=":", linewidth=1)
-    ax.set_title(title or f"{symbol} 权益曲线")
-    ax.set_xlabel("日期")
-    ax.set_ylabel("归一化收益 (起始=100)")
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.3)
+    ax.axhline(y=100, color=_COLORS["grid"], linestyle=":", linewidth=1)
 
-    # x轴日期格式
+    if summary:
+        final_pct = summary.get("profit_pct", 0)
+        dd_pct = summary.get("max_drawdown_pct", 0)
+        sharpe = summary.get("sharpe_ratio", 0)
+        win_rate = summary.get("win_rate", 0)
+        text = f"收益: {final_pct:+.2f}%  回撤: {dd_pct:.2f}%  夏普: {sharpe:.2f}  胜率: {win_rate:.0f}%"
+        ax.text(
+            0.02, 0.97, text,
+            transform=ax.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85, edgecolor="#E0E0E0"),
+        )
+
+    dd_idx, dd_val = _find_max_drawdown_point(values)
+    if dd_val > 1.0 and dd_idx < len(dates):
+        ax.annotate(
+            f"-{dd_val:.1f}%",
+            xy=(dates[dd_idx], norm_values[dd_idx]),
+            xytext=(0, 15),
+            textcoords="offset points",
+            fontsize=9,
+            color=_COLORS["sell"],
+            fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=_COLORS["sell"], lw=1.2),
+        )
+
+    ax.set_title(title or f"{symbol} 权益曲线", fontsize=14, fontweight="bold")
+    ax.set_xlabel("日期", fontsize=11)
+    ax.set_ylabel("归一化收益 (起始=100)", fontsize=11)
+    ax.legend(loc="lower left", framealpha=0.9)
+    ax.grid(True, alpha=0.2)
+
     fig.autofmt_xdate()
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"权益曲线图已保存: {output_path}")
 
@@ -153,7 +198,6 @@ def plot_drawdown_curve(
     symbol: str,
     output_path: str | Path,
 ):
-    """绘制回撤曲线。"""
     if not equity_curve:
         return
 
@@ -171,19 +215,36 @@ def plot_drawdown_curve(
         dd = (peak - v) / peak * 100 if peak > 0 else 0
         drawdowns.append(dd)
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.fill_between(dates, drawdowns, color="#F44336", alpha=0.3)
-    ax.plot(dates, drawdowns, color="#F44336", linewidth=1)
-    ax.set_title(f"{symbol} 回撤曲线")
-    ax.set_xlabel("日期")
-    ax.set_ylabel("回撤 (%)")
-    ax.grid(True, alpha=0.3)
+    fig, ax = plt.subplots(figsize=(14, 4), facecolor=_COLORS["bg"])
+    ax.set_facecolor(_COLORS["bg"])
+
+    ax.fill_between(dates, drawdowns, color=_COLORS["drawdown"], alpha=0.25)
+    ax.plot(dates, drawdowns, color=_COLORS["drawdown"], linewidth=1)
+
+    max_dd = max(drawdowns) if drawdowns else 0
+    if max_dd > 0:
+        max_dd_idx = drawdowns.index(max_dd)
+        ax.annotate(
+            f"-{max_dd:.1f}%",
+            xy=(dates[max_dd_idx], max_dd),
+            xytext=(0, 10),
+            textcoords="offset points",
+            fontsize=10,
+            color=_COLORS["sell"],
+            fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=_COLORS["sell"], lw=1.2),
+        )
+
+    ax.set_title(f"{symbol} 回撤曲线", fontsize=14, fontweight="bold")
+    ax.set_xlabel("日期", fontsize=11)
+    ax.set_ylabel("回撤 (%)", fontsize=11)
+    ax.grid(True, alpha=0.2)
 
     fig.autofmt_xdate()
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"回撤曲线图已保存: {output_path}")

@@ -108,9 +108,10 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
 
                 if benchmark_shares[sym] == 0 and di == 0:
                     open_p = bar["open"]
-                    aff = int(per_stock_budget / (open_p * (1 + self.commission)) / 100) * 100
+                    cost_per_100 = self._calc_buy_cost(open_p, 100)
+                    aff = int(per_stock_budget / cost_per_100) * 100
                     if aff > 0:
-                        cost = aff * open_p * (1 + self.commission)
+                        cost = self._calc_buy_cost(open_p, aff)
                         benchmark_cash -= cost
                         benchmark_shares[sym] = aff
 
@@ -315,6 +316,9 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
         print(f"胜率:     {summary.get('win_rate', 0):.1f}%")
         print(f"盈亏比:   {summary.get('avg_win', 0):.2f} / {summary.get('avg_loss', 0):.2f}")
         print(f"盈利因子: {summary.get('profit_factor', 0):.2f}")
+        print(f"总佣金:   {summary.get('total_commission', 0):,.2f}")
+        print(f"总印花税: {summary.get('total_stamp_tax', 0):,.2f}")
+        print(f"平均持仓: {summary.get('avg_holding_days', 0):.1f} 天")
         print(f"剩余现金: {summary.get('cash', 0):,.2f}")
         print(f"持仓: { {s: qty for s, qty in summary.get('positions', {}).items()} }")
 

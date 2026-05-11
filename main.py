@@ -142,11 +142,10 @@ def export_results(args, summary: dict, symbol: str):
         export_trades_csv(trades, args.output_csv)
 
     if args.chart:
-        from pathlib import Path
         chart_dir = Path(args.chart)
         equity_path = chart_dir / f"{symbol}_equity.png"
         drawdown_path = chart_dir / f"{symbol}_drawdown.png"
-        plot_equity_curve(equity_curve, benchmark_curve, symbol, equity_path)
+        plot_equity_curve(equity_curve, benchmark_curve, symbol, equity_path, summary=summary)
         plot_drawdown_curve(equity_curve, symbol, drawdown_path)
 
 
@@ -265,9 +264,8 @@ def run_portfolio(args, config, logger):
     if args.output_csv:
         export_trades_csv(summary.get("trades_list", []), args.output_csv)
     if args.chart:
-        from pathlib import Path
         chart_dir = Path(args.chart)
-        plot_equity_curve(summary["equity_curve"], summary["benchmark_curve"], ",".join(symbols), chart_dir / "portfolio_equity.png")
+        plot_equity_curve(summary["equity_curve"], summary["benchmark_curve"], ",".join(symbols), chart_dir / "portfolio_equity.png", summary=summary)
         plot_drawdown_curve(summary["equity_curve"], ",".join(symbols), chart_dir / "portfolio_drawdown.png")
 
 

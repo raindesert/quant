@@ -3,15 +3,20 @@ import pandas as pd
 
 
 class DataProcessor:
-    """数据处理器"""
 
     @staticmethod
     def clean(df: pd.DataFrame) -> pd.DataFrame:
-        """清洗数据"""
         df = df.copy()
         df = df.dropna()
         df = df[df["volume"] > 0]
-        return df
+        df = df[df["close"] > 0]
+        df = df[df["open"] > 0]
+        df = df[df["high"] >= df["low"]]
+        df = df[df["high"] >= df[["open", "close"]].max(axis=1)]
+        df = df[df["low"] <= df[["open", "close"]].min(axis=1)]
+        daily_returns = df["close"].pct_change()
+        df = df[daily_returns.abs() < 0.3]
+        return df.reset_index(drop=True)
 
     @staticmethod
     def add_ma(df: pd.DataFrame, periods: list | None = None) -> pd.DataFrame:

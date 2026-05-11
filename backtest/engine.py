@@ -94,9 +94,10 @@ class BacktestEngine(BaseBacktestEngine):
 
             if benchmark_shares == 0:
                 open_price = current_bar["open"]
-                affordable = int(self.initial_cash * 0.5 / (open_price * (1 + self.commission)) / 100) * 100
+                cost_per_100 = self._calc_buy_cost(open_price, 100)
+                affordable = int(self.initial_cash * 0.5 / cost_per_100) * 100
                 if affordable > 0:
-                    cost = affordable * open_price * (1 + self.commission)
+                    cost = self._calc_buy_cost(open_price, affordable)
                     benchmark_cash -= cost
                     benchmark_shares = affordable
             benchmark_value = benchmark_cash + benchmark_shares * current_bar["close"]
@@ -269,5 +270,8 @@ class BacktestEngine(BaseBacktestEngine):
         print(f"胜率:     {summary.get('win_rate', 0):.1f}%")
         print(f"盈亏比:   {summary.get('avg_win', 0):.2f} / {summary.get('avg_loss', 0):.2f}")
         print(f"盈利因子: {summary.get('profit_factor', 0):.2f}")
+        print(f"总佣金:   {summary.get('total_commission', 0):,.2f}")
+        print(f"总印花税: {summary.get('total_stamp_tax', 0):,.2f}")
+        print(f"平均持仓: {summary.get('avg_holding_days', 0):.1f} 天")
         print(f"剩余现金: {summary.get('cash', 0):,.2f}")
         print(f"持仓: {position_snapshot}")
