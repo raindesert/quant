@@ -33,11 +33,12 @@ class DataProcessor:
 
     @staticmethod
     def add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-        """添加 RSI 指标"""
         df = df.copy()
         delta = df["close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        rs = avg_gain / avg_loss
         df["rsi"] = 100 - (100 / (1 + rs))
         return df

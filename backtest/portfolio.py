@@ -76,54 +76,49 @@ class PortfolioBacktestEngine:
             print("所有股票均无数据")
             return None
 
-        # 对齐所有股票的日期（取交集）
         all_dates_sets = [set(df["date"]) for df in symbol_data.values()]
-        common_dates = set.intersection(*all_dates_sets) if all_dates_sets else set()
-        for df in symbol_data.values():
-            common_dates &= set(df["date"])
+        common_dates = sorted(set.intersection(*all_dates_sets)) if all_dates_sets else []
 
         if not common_dates:
-            # 取并集
             all_dates: list = []
             for df in symbol_data.values():
                 all_dates.extend(df["date"].tolist())
             common_dates = sorted(set(all_dates))
 
-        common_dates = sorted(common_dates)
         print(f"组合回测: {len(symbols)} 只股票, {len(common_dates)} 个交易日")
 
-        # 创建每个股票的独立策略实例
         strategies = {sym: strategy_factory() for sym in symbol_data}
 
-        # 预处理：让策略预热（前20根bar）
-        warmup_bars = min(20, len(common_dates) - 1)
+        symbol_date_index = {}
         for sym, df in symbol_data.items():
-            bars = list(df.itertuples(index=False))
-            warmup_count = min(warmup_bars, len(bars) - 1)
-            for row in bars[:warmup_count]:
+            symbol_date_index[sym] = {row.date: row for row in df.itertuples(index=False)}
+
+        warmup_count = min(20, len(common_dates) - 1)
+        warmup_dates = common_dates[:warmup_count]
+        for sym in symbol_data:
+            for date in warmup_dates:
+                row = symbol_date_index[sym].get(date)
+                if row is None:
+                    continue
                 bar = self._row_to_bar(row, sym)
                 self.last_prices[sym] = bar["close"]
                 strategies[sym].on_bar(bar)
 
-        # 初始化基准持仓（每个股票等权分配一半资金的1/max_positions）
         benchmark_shares = {sym: 0 for sym in symbol_data}
         benchmark_cash = self.initial_cash
-        first_date = common_dates[0]
         per_stock_budget = self.initial_cash * 0.5 / len(symbol_data)
 
-        # 主循环：按日期遍历
-        for di, date in enumerate(common_dates[:-1]):
-            # 获取当日所有股票的bar
+        trading_dates = common_dates[warmup_count:]
+        for di, date in enumerate(trading_dates[:-1]):
             bars = {}
-            for sym, df in symbol_data.items():
-                row = df[df["date"] == date]
-                if row.empty:
+            for sym in symbol_data:
+                row = symbol_date_index[sym].get(date)
+                if row is None:
                     continue
-                bar = self._row_to_bar(row.iloc[0], symbol=sym)
+                bar = self._row_to_bar(row, symbol=sym)
                 bars[sym] = bar
                 self.last_prices[sym] = bar["close"]
 
-                # 初始化基准持仓（首日）
                 if benchmark_shares[sym] == 0 and di == 0:
                     open_p = bar["open"]
                     aff = int(per_stock_budget / (open_p * (1 + self.commission)) / 100) * 100
@@ -176,13 +171,13 @@ class PortfolioBacktestEngine:
             self._last_actions = actions
 
         # 处理最后一天
-        last_date = common_dates[-1]
+        last_date = trading_dates[-1]
         last_bars = {}
-        for sym, df in symbol_data.items():
-            row = df[df["date"] == last_date]
-            if row.empty:
+        for sym in symbol_data:
+            row = symbol_date_index[sym].get(last_date)
+            if row is None:
                 continue
-            bar = self._row_to_bar(row.iloc[0], sym)
+            bar = self._row_to_bar(row, sym)
             last_bars[sym] = bar
             self.last_prices[sym] = bar["close"]
 
@@ -268,11 +263,11 @@ class PortfolioBacktestEngine:
         alpha = profit_pct - bm_ret
 
         # 交易统计
-        buy_trades = [t for t in self.trades if t["action"] == "BUY"]
         sell_trades = [t for t in self.trades if t["action"] == "SELL"]
         wins, total_profit, total_loss = 0, 0.0, 0.0
-        for i in range(min(len(sell_trades), len(buy_trades))):
-            pnl = (sell_trades[i]["price"] - buy_trades[i]["price"]) * sell_trades[i]["quantity"]
+        for t in sell_trades:
+            entry_price = self.entry_prices.get(t["symbol"], 0.0)
+            pnl = (t["price"] - entry_price) * t["quantity"]
             if pnl > 0:
                 wins += 1
                 total_profit += pnl
@@ -284,15 +279,15 @@ class PortfolioBacktestEngine:
         avg_loss = total_loss / (len(sell_trades) - wins) if sell_trades and len(sell_trades) > wins else 0.0
         profit_factor = total_profit / total_loss if total_loss > 0 else float("inf") if total_profit > 0 else 0.0
 
-        # 各股票独立结果
         symbol_results = []
         for sym in symbols:
             sym_trades = [t for t in self.trades if t["symbol"] == sym]
-            sym_buy = [t for t in sym_trades if t["action"] == "BUY"]
             sym_sell = [t for t in sym_trades if t["action"] == "SELL"]
             sym_wins = 0
-            for i in range(min(len(sym_sell), len(sym_buy))):
-                if (sym_sell[i]["price"] - sym_buy[i]["price"]) * sym_sell[i]["quantity"] > 0:
+            for t in sym_sell:
+                entry_price = self.entry_prices.get(sym, 0.0)
+                pnl = (t["price"] - entry_price) * t["quantity"]
+                if pnl > 0:
                     sym_wins += 1
             symbol_results.append({
                 "symbol": sym,

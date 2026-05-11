@@ -13,13 +13,13 @@ class SMAStrategy(BaseStrategy):
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])
-        if len(self.prices) < self.slow:
+        if len(self.prices) < self.slow + 1:
             return Signal.HOLD
 
         fast_ma = sum(self.prices[-self.fast:]) / self.fast
         slow_ma = sum(self.prices[-self.slow:]) / self.slow
-        prev_fast_ma = sum(self.prices[-self.fast-1:-1]) / self.fast
-        prev_slow_ma = sum(self.prices[-self.slow-1:-1]) / self.slow
+        prev_fast_ma = sum(self.prices[-self.fast - 1:-1]) / self.fast
+        prev_slow_ma = sum(self.prices[-self.slow - 1:-1]) / self.slow
 
         position = self.get_position(bar["symbol"])
 

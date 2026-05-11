@@ -363,10 +363,10 @@ def run_backtest(args, config, logger):
         # 每行：股票 + 各策略收益率
         for result in all_results:
             row = f"{result['symbol']:<15s}"
-            results_map = {r["strategy"]: r for r in result["results"]}
+            strategy_result_map = {r["strategy"]: r for r in result["results"]}
             for s in strategy_names:
-                if s in results_map:
-                    row += f"{results_map[s]['profit_pct']:+12.2f}%"
+                if s in strategy_result_map:
+                    row += f"{strategy_result_map[s]['profit_pct']:+12.2f}%"
                 else:
                     row += f"{'N/A':>12s}"
             print(row)

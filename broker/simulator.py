@@ -15,7 +15,9 @@ class SimulatorBroker:
         self.trades = []
 
     def buy(self, symbol: str, price: float, quantity: int, timestamp: datetime = None) -> bool:
-        """买入"""
+        quantity = (quantity // 100) * 100
+        if quantity <= 0:
+            return False
         total_cost = price * quantity * (1 + self.commission)
         if total_cost > self.cash:
             return False
@@ -35,13 +37,14 @@ class SimulatorBroker:
         return True
 
     def sell(self, symbol: str, price: float, quantity: int, timestamp: datetime = None) -> bool:
-        """卖出"""
         if self.positions.get(symbol, 0) < quantity:
             return False
 
         proceeds = price * quantity * (1 - self.commission)
         self.cash += proceeds
         self.positions[symbol] -= quantity
+        if self.positions[symbol] <= 0:
+            del self.positions[symbol]
 
         trade = {
             "timestamp": timestamp or datetime.now(),

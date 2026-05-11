@@ -91,31 +91,29 @@ class BacktestEngine:
 
         print(f"回测开始: {symbol}, 数据量: {len(df)}")
 
-        # 先让策略处理第一根 bar，生成初始信号
         bars = list(df.itertuples(index=False))
         if not bars:
             return None
 
-        # 预加载 bar 数据用于策略初始化
+        warmup_count = min(20, len(bars) - 1)
+
         first_bar = self._row_to_bar(bars[0], symbol)
         self.last_prices[symbol] = first_bar["close"]
-        benchmark_shares = 0  # 基准持仓股数
-        benchmark_cash = self.initial_cash  # 基准现金
+        benchmark_shares = 0
+        benchmark_cash = self.initial_cash
 
-        for i, row in enumerate(bars[:20]):
+        for i, row in enumerate(bars[:warmup_count]):
             bar = self._row_to_bar(row, symbol)
             self.last_prices[symbol] = bar["close"]
             strategy.on_bar(bar)
 
-        # 主循环: bar i 的信号在 bar i+1 的开盘价执行
-        for i in range(len(bars) - 1):
+        for i in range(warmup_count, len(bars) - 1):
             current_bar = self._row_to_bar(bars[i], symbol)
             next_bar = self._row_to_bar(bars[i + 1], symbol)
 
             self.last_prices[symbol] = current_bar["close"]
 
-            # 更新基准持仓（买入持有策略：首日用一半资金买入，持有不动）
-            if benchmark_shares == 0 and i == 0:
+            if benchmark_shares == 0:
                 open_price = current_bar["open"]
                 affordable = int(self.initial_cash * 0.5 / (open_price * (1 + self.commission)) / 100) * 100
                 if affordable > 0:
@@ -125,17 +123,13 @@ class BacktestEngine:
             benchmark_value = benchmark_cash + benchmark_shares * current_bar["close"]
             self.benchmark_curve.append({"date": current_bar["date"], "value": benchmark_value})
 
-            # 检查止损
             self._check_stop_loss(symbol, next_bar["open"])
-            # 检查止盈
             self._check_take_profit(symbol, next_bar["open"])
 
-            # 执行上一根 bar 产生的信号
             if symbol in self.pending_signal:
                 signal = self.pending_signal.pop(symbol)
                 self._execute_signal(signal, next_bar, strategy)
 
-            # 生成新信号（下一根 bar 执行）
             signal = strategy.on_bar(current_bar)
             if signal != Signal.HOLD:
                 self.pending_signal[symbol] = signal
@@ -256,21 +250,23 @@ class BacktestEngine:
 
         # 交易统计
         trades = len(self.trades)
-        buy_trades = [t for t in self.trades if t["action"] == "BUY"]
         sell_trades = [t for t in self.trades if t["action"] == "SELL"]
         win_trades = 0
         total_profit = 0.0
         total_loss = 0.0
-        for i in range(0, len(sell_trades)):
-            if i < len(buy_trades):
-                buy_price = buy_trades[i]["price"]
-                sell_price = sell_trades[i]["price"]
-                pnl = (sell_price - buy_price) * sell_trades[i]["quantity"]
-                if pnl > 0:
-                    win_trades += 1
-                    total_profit += pnl
-                else:
-                    total_loss += abs(pnl)
+        for t in sell_trades:
+            entry_price = self.entry_prices.get(t["symbol"], 0.0)
+            if entry_price <= 0:
+                for bt in reversed(self.trades):
+                    if bt["symbol"] == t["symbol"] and bt["action"] == "BUY" and bt["date"] <= t["date"]:
+                        entry_price = bt["price"]
+                        break
+            pnl = (t["price"] - entry_price) * t["quantity"]
+            if pnl > 0:
+                win_trades += 1
+                total_profit += pnl
+            else:
+                total_loss += abs(pnl)
         win_rate = win_trades / len(sell_trades) * 100 if sell_trades else 0.0
         avg_win = total_profit / win_trades if win_trades else 0.0
         avg_loss = total_loss / (len(sell_trades) - win_trades) if sell_trades and len(sell_trades) > win_trades else 0.0
