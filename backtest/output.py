@@ -11,8 +11,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# 中文字体支持
-plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "DejaVu Sans"]
+# 中文字体支持 - 按优先级尝试可用字体
+plt.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",
+    "SimHei",
+    "FangSong",
+    "STSong",
+    "DejaVu Sans",
+]
 plt.rcParams["axes.unicode_minus"] = False
 
 
