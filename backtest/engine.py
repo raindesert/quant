@@ -31,6 +31,7 @@ class BacktestEngine(BaseBacktestEngine):
         slippage_type: str = "percent",
         enforce_t_plus_1: bool = True,
         check_limit: bool = True,
+        risk_manager=None,
     ):
         super().__init__(
             initial_cash=initial_cash,
@@ -42,6 +43,7 @@ class BacktestEngine(BaseBacktestEngine):
             slippage_type=slippage_type,
             enforce_t_plus_1=enforce_t_plus_1,
             check_limit=check_limit,
+            risk_manager=risk_manager,
         )
         self.position_size = position_size
 
@@ -154,6 +156,11 @@ class BacktestEngine(BaseBacktestEngine):
         price = bar["open"]
         position = self.positions.get(symbol, 0)
 
+        if bar["date"] != self._prev_date:
+            if self._prev_date is not None and self.risk_manager is not None:
+                self.risk_manager.on_new_day(bar["date"])
+            self._prev_date = bar["date"]
+
         if signal == Signal.BUY:
             if self._is_limit_up(symbol, bar):
                 return
@@ -164,6 +171,23 @@ class BacktestEngine(BaseBacktestEngine):
             affordable_quantity = int(available_cash / (actual_price * (1 + self.commission)) / lot_size) * lot_size
             if affordable_quantity <= 0:
                 return
+
+            if self.risk_manager is not None:
+                total_value = self.get_total_value()
+                risk_result = self.risk_manager.check_buy(
+                    symbol=symbol,
+                    price=actual_price,
+                    quantity=affordable_quantity,
+                    total_value=total_value,
+                    cash=self.cash,
+                    positions=self.positions,
+                    last_prices=self.last_prices,
+                )
+                if not risk_result.allowed:
+                    return
+                affordable_quantity = risk_result.adjusted_quantity
+                if affordable_quantity <= 0:
+                    return
 
             cost = self._calc_buy_cost(actual_price, affordable_quantity)
             if cost > self.cash:
@@ -205,10 +229,23 @@ class BacktestEngine(BaseBacktestEngine):
                 return
 
             actual_price = self._apply_slippage(price, "sell")
+            entry_price = self.entry_prices.get(symbol, actual_price)
+
+            if self.risk_manager is not None:
+                total_value = self.get_total_value()
+                risk_result = self.risk_manager.check_sell(
+                    symbol=symbol,
+                    price=actual_price,
+                    quantity=position,
+                    entry_price=entry_price,
+                    total_value=total_value,
+                )
+                if not risk_result.allowed:
+                    return
+
             proceeds = self._calc_sell_proceeds(actual_price, position)
             commission_cost = max(actual_price * position * self.commission, self.min_commission)
             stamp_cost = actual_price * position * self.stamp_tax
-            entry_price = self.entry_prices.get(symbol, actual_price)
             self.cash += proceeds
             self.positions.pop(symbol, None)
             self.entry_prices.pop(symbol, None)

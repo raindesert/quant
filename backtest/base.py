@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from strategy.base import Signal
+from risk.manager import RiskManager
 
 LIMIT_UP_THRESHOLD_ST = 0.05
 LIMIT_UP_THRESHOLD_MAIN = 0.10
@@ -13,7 +14,7 @@ class BaseBacktestEngine:
     """回测引擎公共基类。
 
     提供账户管理、指标计算、止损止盈检查等共享功能。
-    支持: T+1约束、滑点模型、涨跌停判断。
+    支持: T+1约束、滑点模型、涨跌停判断、风控管理。
     """
 
     TRADING_DAYS_PER_YEAR = 244
@@ -32,6 +33,7 @@ class BaseBacktestEngine:
         slippage_type: str = "percent",
         enforce_t_plus_1: bool = True,
         check_limit: bool = True,
+        risk_manager: RiskManager | None = None,
     ):
         self.initial_cash = initial_cash
         self.commission = commission
@@ -44,6 +46,7 @@ class BaseBacktestEngine:
         self.slippage_type = slippage_type
         self.enforce_t_plus_1 = enforce_t_plus_1
         self.check_limit = check_limit
+        self.risk_manager = risk_manager
         self.reset()
 
     def reset(self):
@@ -58,6 +61,9 @@ class BaseBacktestEngine:
         self.last_bars = {}
         self.pending_signal = {}
         self._last_action = None
+        self._prev_date = None
+        if self.risk_manager is not None:
+            self.risk_manager.reset()
 
     @staticmethod
     def _row_to_bar(row, symbol: str) -> dict:

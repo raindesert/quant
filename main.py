@@ -11,9 +11,11 @@ from backtest.engine import BacktestEngine
 from backtest.output import export_summary_json, export_trades_csv, plot_drawdown_curve, plot_equity_curve
 from backtest.portfolio import PortfolioBacktestEngine
 from backtest.optimizer import StrategyOptimizer, DEFAULT_GRIDS, OPTIMIZE_METRICS
+from backtest.walk_forward import WalkForwardValidator
 from broker.simulator import SimulatorBroker
 from data.fetcher import DataFetcher
 from monitor.realtime import RealtimeMonitor
+from risk.manager import RiskManager
 from strategy.examples import (
     BollingerStrategy,
     MACDStrategy,
@@ -27,11 +29,23 @@ from utils.logger import setup_logger
 
 def _run_single_backtest(args_tuple):
     """独立函数，用于并发回测（必须是模块级以支持 pickle）。"""
-    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit = args_tuple
+    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params = args_tuple
     strategy_cls = STRATEGIES.get(strategy_name.lower())
     if strategy_cls is None:
         strategy_cls = SMAStrategy
     strategy = strategy_cls()
+
+    risk_manager = None
+    if risk_params and risk_params.get("enabled"):
+        risk_manager = RiskManager(
+            max_position_pct=risk_params.get("max_position_pct", 0.25),
+            max_positions=risk_params.get("max_positions", 10),
+            max_drawdown_pct=risk_params.get("max_drawdown_pct", 0.20),
+            max_daily_loss_pct=risk_params.get("max_daily_loss_pct", 0.03),
+            max_stock_loss_pct=risk_params.get("max_stock_loss_pct", 0.10),
+            enabled=True,
+        )
+
     engine = BacktestEngine(
         initial_cash=initial_cash,
         commission=commission,
@@ -43,6 +57,7 @@ def _run_single_backtest(args_tuple):
         slippage_type=slippage_type,
         enforce_t_plus_1=enforce_t1,
         check_limit=check_limit,
+        risk_manager=risk_manager,
     )
     summary = engine.run(
         strategy,
@@ -77,6 +92,28 @@ def get_strategy(strategy_name: str):
         print(f"未知策略: {strategy_name}，将使用默认策略 SMA")
         return SMAStrategy()
     return strategy_cls()
+
+
+def build_risk_manager(args, config) -> RiskManager | None:
+    """根据命令行参数和配置创建风控管理器。"""
+    risk_config = config.get("risk", {})
+    enabled = risk_config.get("enabled", True)
+    if hasattr(args, "no_risk") and args.no_risk:
+        enabled = False
+    if hasattr(args, "risk_enabled") and args.risk_enabled:
+        enabled = True
+
+    if not enabled:
+        return None
+
+    return RiskManager(
+        max_position_pct=args.max_position_pct if hasattr(args, "max_position_pct") and args.max_position_pct is not None else risk_config.get("max_position_pct", 0.25),
+        max_positions=args.risk_max_positions if hasattr(args, "risk_max_positions") and args.risk_max_positions is not None else risk_config.get("max_positions", 10),
+        max_drawdown_pct=args.max_drawdown_pct if hasattr(args, "max_drawdown_pct") and args.max_drawdown_pct is not None else risk_config.get("max_drawdown_pct", 0.20),
+        max_daily_loss_pct=args.max_daily_loss_pct if hasattr(args, "max_daily_loss_pct") and args.max_daily_loss_pct is not None else risk_config.get("max_daily_loss_pct", 0.03),
+        max_stock_loss_pct=args.max_stock_loss_pct if hasattr(args, "max_stock_loss_pct") and args.max_stock_loss_pct is not None else risk_config.get("max_stock_loss_pct", 0.10),
+        enabled=True,
+    )
 
 
 def load_config():
@@ -244,6 +281,8 @@ def run_portfolio(args, config, logger):
     enforce_t1 = args.enforce_t1 if hasattr(args, "enforce_t1") else backtest_config.get("enforce_t_plus_1", True)
     check_limit = args.check_limit if hasattr(args, "check_limit") else backtest_config.get("check_limit", True)
 
+    risk_manager = build_risk_manager(args, config)
+
     symbols = resolve_symbols(args, config, logger)
     if not symbols:
         logger.error("没有可用的股票代码")
@@ -269,12 +308,12 @@ def run_portfolio(args, config, logger):
         slippage_type=slippage_type,
         enforce_t_plus_1=enforce_t1,
         check_limit=check_limit,
+        risk_manager=risk_manager,
     )
     summary = engine.run(make_strategy, symbols, days=days)
     if summary is None:
         return
 
-    # 导出结果
     if args.output_json:
         export_summary_json(summary, summary["equity_curve"], summary["benchmark_curve"], args.output_json)
     if args.output_csv:
@@ -302,6 +341,11 @@ def run_backtest(args, config, logger):
     end_date = backtest_config.get("end_date")
     parallel = getattr(args, "parallel", True)
 
+    risk_manager = build_risk_manager(args, config)
+    risk_params = None
+    if risk_manager is not None:
+        risk_params = risk_manager.get_status()
+
     symbols = resolve_symbols(args, config, logger)
     if not symbols:
         return
@@ -309,23 +353,27 @@ def run_backtest(args, config, logger):
     verbose = args.verbose
     strategy_name = args.strategy or DEFAULT_STRATEGY
 
+    if risk_manager is not None:
+        logger.info("风控已启用: 最大仓位%.0f%%, 最大持仓%d, 最大回撤%.0f%%, 日亏损%.0f%%, 个股亏损%.0f%%",
+                     risk_manager.max_position_pct * 100, risk_manager.max_positions,
+                     risk_manager.max_drawdown_pct * 100, risk_manager.max_daily_loss_pct * 100,
+                     risk_manager.max_stock_loss_pct * 100)
+
     if args.all_strategies:
         strategy_names = list(STRATEGIES.keys())
         all_results = []
 
-        # 构建所有 (strategy, symbol) 任务
         tasks = []
         for symbol in symbols:
             for s in strategy_names:
-                tasks.append((s, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit))
+                tasks.append((s, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params))
 
         print(f"\n{'=' * 60}")
         print(f"批量回测: {len(symbols)} 只股票 x {len(strategy_names)} 种策略 = {len(tasks)} 个任务 (并发执行)")
         print(f"{'=' * 60}")
 
-        # 并发执行
         t0 = time.time()
-        results_map = {}  # (symbol, strategy) -> result
+        results_map = {}
         with ProcessPoolExecutor(max_workers=min(8, len(tasks))) as executor:
             futures = {executor.submit(_run_single_backtest, t): t for t in tasks}
             done = 0
@@ -344,7 +392,6 @@ def run_backtest(args, config, logger):
         elapsed = time.time() - t0
         print(f"  完成，耗时 {elapsed:.1f}s")
 
-        # 整理结果
         for symbol in symbols:
             strategy_results = []
             for s in strategy_names:
@@ -371,14 +418,12 @@ def run_backtest(args, config, logger):
         print("策略对比汇总")
         print(f"{'=' * 60}")
 
-        # 表头：股票 + 所有策略
         header = f"{'股票':<15s}"
         for s in strategy_names:
             header += f"{s:>12s}"
         print(header)
         print("-" * (15 + 12 * len(strategy_names)))
 
-        # 每行：股票 + 各策略收益率
         for result in all_results:
             row = f"{result['symbol']:<15s}"
             strategy_result_map = {r["strategy"]: r for r in result["results"]}
@@ -389,7 +434,6 @@ def run_backtest(args, config, logger):
                     row += f"{'N/A':>12s}"
             print(row)
 
-        # 打印详细统计
         print(f"\n{'=' * 60}")
         print("各策略统计")
         print(f"{'策略':<15s} {'平均收益':>10s} {'平均Alpha':>10s} {'平均最大回撤':>13s} {'平均夏普':>10s} {'胜率':>8s}")
@@ -417,7 +461,6 @@ def run_backtest(args, config, logger):
                 print(f"{s:<15s} {avg:+10.2f}% {avg_alpha:+10.2f}% {avg_dd:>12.2f}% {avg_sharpe:>10.2f} {win_rate:>7.1f}%")
         return
 
-    # 单策略批量回测（支持并发）
     results = []
 
     if parallel and len(symbols) > 1:
@@ -425,7 +468,7 @@ def run_backtest(args, config, logger):
         print(f"批量回测: {len(symbols)} 只股票 (并发执行)")
         print(f"{'=' * 50}")
         t0 = time.time()
-        tasks = [(strategy_name, s, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit) for s in symbols]
+        tasks = [(strategy_name, s, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params) for s in symbols]
         with ProcessPoolExecutor(max_workers=min(8, len(symbols))) as executor:
             futures = [executor.submit(_run_single_backtest, t) for t in tasks]
             for future in as_completed(futures):
@@ -456,6 +499,7 @@ def run_backtest(args, config, logger):
                 slippage_type=slippage_type,
                 enforce_t_plus_1=enforce_t1,
                 check_limit=check_limit,
+                risk_manager=risk_manager,
             )
             summary = engine.run(
                 get_strategy(strategy_name),
@@ -566,11 +610,85 @@ def run_realtime(args, config, logger):
         monitor.stop()
 
 
+def run_walk_forward(args, config, logger):
+    """运行 Walk-Forward 验证。"""
+    backtest_config = config.get("backtest", {})
+    wf_config = config.get("walk_forward", {})
+    strategy_name = args.strategy or DEFAULT_STRATEGY
+    symbol = args.symbol or config.get("default_symbol", "000001.SZ")
+    commission = backtest_config.get("commission", 0.0003)
+    stop_loss = args.stop_loss if args.stop_loss is not None else backtest_config.get("stop_loss", 0.0)
+    take_profit = args.take_profit if args.take_profit is not None else backtest_config.get("take_profit", 0.0)
+    position_size = args.position_size if args.position_size is not None else backtest_config.get("position_size", 1.0)
+    slippage = args.slippage if args.slippage is not None else backtest_config.get("slippage", 0.001)
+    slippage_type = args.slippage_type if args.slippage_type else backtest_config.get("slippage_type", "percent")
+    enforce_t1 = args.enforce_t1 if hasattr(args, "enforce_t1") else backtest_config.get("enforce_t_plus_1", True)
+    check_limit = args.check_limit if hasattr(args, "check_limit") else backtest_config.get("check_limit", True)
+
+    train_days = args.wf_train_days if hasattr(args, "wf_train_days") and args.wf_train_days else wf_config.get("train_days", 120)
+    test_days = args.wf_test_days if hasattr(args, "wf_test_days") and args.wf_test_days else wf_config.get("test_days", 60)
+    step_days = args.wf_step_days if hasattr(args, "wf_step_days") and args.wf_step_days else wf_config.get("step_days", 60)
+    overfit_threshold = wf_config.get("overfit_threshold", 0.5)
+
+    logger.info("启动 Walk-Forward 验证: %s / %s", strategy_name, symbol)
+    logger.info("参数: 训练%d天, 验证%d天, 步进%d天", train_days, test_days, step_days)
+
+    validator = WalkForwardValidator(
+        strategy_name=strategy_name,
+        symbol=symbol,
+        train_days=train_days,
+        test_days=test_days,
+        step_days=step_days,
+        commission=commission,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        position_size=position_size,
+        slippage=slippage,
+        slippage_type=slippage_type,
+        enforce_t_plus_1=enforce_t1,
+        check_limit=check_limit,
+        overfit_threshold=overfit_threshold,
+    )
+
+    result = validator.validate()
+    print(result.summary())
+
+    if args.output_json:
+        import json
+        output = {
+            "strategy": result.strategy_name,
+            "symbol": result.symbol,
+            "avg_train_return": result.avg_train_return,
+            "avg_test_return": result.avg_test_return,
+            "avg_train_sharpe": result.avg_train_sharpe,
+            "avg_test_sharpe": result.avg_test_sharpe,
+            "degradation_ratio": result.degradation_ratio,
+            "is_overfit": result.is_overfit,
+            "windows": [
+                {
+                    "window_id": w.window_id,
+                    "train_start": w.train_start,
+                    "train_end": w.train_end,
+                    "test_start": w.test_start,
+                    "test_end": w.test_end,
+                    "train_return": w.train_result.get("profit_pct", 0),
+                    "test_return": w.test_result.get("profit_pct", 0),
+                    "train_sharpe": w.train_result.get("sharpe_ratio", 0),
+                    "test_sharpe": w.test_result.get("sharpe_ratio", 0),
+                }
+                for w in result.windows
+            ],
+        }
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        print(f"\nWalk-Forward 结果已导出: {args.output_json}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="量化交易系统")
     parser.add_argument(
         "--mode",
-        choices=["backtest", "simulate", "realtime", "optimize"],
+        choices=["backtest", "simulate", "realtime", "optimize", "walkforward"],
         default="backtest",
         help="运行模式",
     )
@@ -598,6 +716,20 @@ def main():
     parser.add_argument("--optimize-top", type=int, default=10, help="排行榜显示前N名（默认10）")
     parser.add_argument("--optimize-workers", type=int, default=4, help="并发进程数（默认4）")
 
+    risk_group = parser.add_argument_group("风控参数")
+    risk_group.add_argument("--no-risk", action="store_true", help="禁用风控模块")
+    risk_group.add_argument("--risk-enabled", action="store_true", help="强制启用风控模块")
+    risk_group.add_argument("--max-position-pct", type=float, default=None, help="单股最大仓位占比 (如0.25=25%%)")
+    risk_group.add_argument("--risk-max-positions", type=int, default=None, help="最大持仓数量")
+    risk_group.add_argument("--max-drawdown-pct", type=float, default=None, help="最大回撤熔断阈值 (如0.20=20%%)")
+    risk_group.add_argument("--max-daily-loss-pct", type=float, default=None, help="单日最大亏损阈值 (如0.03=3%%)")
+    risk_group.add_argument("--max-stock-loss-pct", type=float, default=None, help="单股最大亏损阈值 (如0.10=10%%)")
+
+    wf_group = parser.add_argument_group("Walk-Forward 参数")
+    wf_group.add_argument("--wf-train-days", type=int, default=None, help="Walk-Forward 训练期天数 (默认120)")
+    wf_group.add_argument("--wf-test-days", type=int, default=None, help="Walk-Forward 验证期天数 (默认60)")
+    wf_group.add_argument("--wf-step-days", type=int, default=None, help="Walk-Forward 步进天数 (默认60)")
+
     args = parser.parse_args()
     logger = setup_logger()
     config = load_config()
@@ -613,6 +745,8 @@ def main():
         run_realtime(args, config, logger)
     elif args.mode == "optimize":
         run_optimize(args, config, logger)
+    elif args.mode == "walkforward":
+        run_walk_forward(args, config, logger)
 
 
 if __name__ == "__main__":

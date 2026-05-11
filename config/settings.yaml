@@ -15,6 +15,20 @@ backtest:
   enforce_t_plus_1: true
   check_limit: true
 
+risk:
+  enabled: true
+  max_position_pct: 0.25
+  max_positions: 10
+  max_drawdown_pct: 0.20
+  max_daily_loss_pct: 0.03
+  max_stock_loss_pct: 0.10
+
+walk_forward:
+  train_days: 120
+  test_days: 60
+  step_days: 60
+  overfit_threshold: 0.5
+
 data:
   fetch_interval: 60
   use_local_cache: true
