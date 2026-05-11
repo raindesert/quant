@@ -18,7 +18,7 @@ python main.py --mode backtest --symbol 000001.SZ --days 120 --strategy sma
 # 显示交易明细
 python main.py --mode backtest --symbol 000001.SZ --verbose
 
-# 测试所有策略并对比
+# 测试所有策略并对比（并发）
 python main.py --mode backtest --symbol 000001.SZ --all-strategies
 
 # 批量回测（从文件读取股票代码）
@@ -26,6 +26,12 @@ python main.py --mode backtest --symbols symbols.txt --strategy rsi
 
 # 批量测试所有策略
 python main.py --mode backtest --symbols symbols.txt --all-strategies
+
+# 止损+止盈
+python main.py --mode backtest --symbol 000001.SZ --stop-loss 0.05 --take-profit 0.10
+
+# 半仓+并发
+python main.py --mode backtest --symbols symbols.txt --strategy sma --position-size 0.5
 
 # 模拟交易
 python main.py --mode simulate --symbol 000001.SZ --strategy bollinger
@@ -44,7 +50,11 @@ python main.py --mode realtime --symbol 000001.SZ
 | `--days` | 回测天数，默认250天 |
 | `--strategy` | 策略名称，默认 sma |
 | `--verbose` | 显示交易明细 |
-| `--all-strategies` | 测试所有策略并对比 |
+| `--all-strategies` | 测试所有策略并对比（并发） |
+| `--stop-loss` | 止损比例（如0.05=5%） |
+| `--take-profit` | 止盈比例（如0.10=10%） |
+| `--position-size` | 仓位比例 0.0~1.0（默认1.0） |
+| `--no-parallel` | 禁用并发批量回测 |
 
 ## 策略列表
 

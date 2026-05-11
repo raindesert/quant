@@ -49,7 +49,7 @@ class DataFetcher:
         return int(digest[:8], 16)
 
     def get_history(self, symbol: str, days: int = 250) -> pd.DataFrame:
-        """获取历史日线数据。"""
+        """获取历史日线数据。优先使用 AKShare（支持更长周期），腾讯作为降级方案。"""
         if days <= 0:
             raise ValueError("days 必须大于 0")
 
@@ -58,8 +58,18 @@ class DataFetcher:
         if cached is not None:
             return cached.copy()
 
-        tx_symbol = self._to_tencent_symbol(symbol)
+        # 优先：AKShare（支持多年历史数据）
+        if AKSHARE_AVAILABLE:
+            try:
+                df = self._fetch_from_akshare(symbol, days)
+                if not df.empty and len(df) >= days * 0.7:
+                    self.cache[cache_key] = df.copy()
+                    return df
+            except Exception as exc:
+                print(f"AKShare获取失败: {exc}")
 
+        # 降级：腾讯财经
+        tx_symbol = self._to_tencent_symbol(symbol)
         try:
             df = self._fetch_from_tencent(tx_symbol, days)
             if not df.empty:
@@ -68,15 +78,7 @@ class DataFetcher:
         except Exception as exc:
             print(f"腾讯API获取失败: {exc}")
 
-        if AKSHARE_AVAILABLE:
-            try:
-                df = self._fetch_from_akshare(symbol, days)
-                if not df.empty:
-                    self.cache[cache_key] = df.copy()
-                    return df
-            except Exception as exc:
-                print(f"AKShare获取失败: {exc}")
-
+        #兜底：模拟数据
         print("使用模拟数据")
         df = self._generate_mock_data(symbol, days)
         self.cache[cache_key] = df.copy()

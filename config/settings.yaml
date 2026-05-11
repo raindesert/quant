@@ -7,6 +7,7 @@ backtest:
   # end_date: "20231231"        # 回测结束日期 (YYYYMMDD)
   commission: 0.0003           # 交易佣金 (0.03%)
   stop_loss: 0.0              # 止损比例 (0.05 = 5%)，0 表示禁用
+  take_profit: 0.0            # 止盈比例 (0.10 = 10%)，0 表示禁用
   position_size: 1.0          # 仓位比例 0.0~1.0 (1.0 = 全仓)
   days: 250                   # 默认回测天数
 

@@ -1,6 +1,7 @@
-"""事件驱动回测引擎 - 修复 look-ahead bias，支持止损和仓位管理。"""
+"""事件驱动回测引擎 - 修复 look-ahead bias，支持止损/止盈和仓位管理，增强指标。"""
 from __future__ import annotations
 
+import math
 import pandas as pd
 
 from data.fetcher import DataFetcher
@@ -24,12 +25,14 @@ class BacktestEngine:
         commission: float = 0.0003,
         verbose: bool = False,
         stop_loss: float = 0.0,
+        take_profit: float = 0.0,
         position_size: float = 1.0,
     ):
         self.initial_cash = initial_cash
         self.commission = commission
         self.verbose = verbose
         self.stop_loss = stop_loss
+        self.take_profit = take_profit  # 止盈比例 (0.10 = 10%)，0 表示禁用
         self.position_size = position_size  # 0.0 ~ 1.0, 仓位比例
         self.reset()
 
@@ -37,10 +40,13 @@ class BacktestEngine:
         """重置回测状态，便于同一实例重复运行。"""
         self.cash = self.initial_cash
         self.positions = {}
+        self.entry_prices = {}  # 各标的入场价格
         self.trades = []
         self.equity_curve = []
+        self.benchmark_curve = []  # 基准（买入持有）曲线
         self.last_prices = {}
         self.pending_signal = {}  # 待执行的信号
+        self._last_action = None  # 最近一次交易动作（用于图标标注）
 
     def run(
         self,
@@ -91,6 +97,11 @@ class BacktestEngine:
             return None
 
         # 预加载 bar 数据用于策略初始化
+        first_bar = self._row_to_bar(bars[0], symbol)
+        self.last_prices[symbol] = first_bar["close"]
+        benchmark_shares = 0  # 基准持仓股数
+        benchmark_cash = self.initial_cash  # 基准现金
+
         for i, row in enumerate(bars[:20]):
             bar = self._row_to_bar(row, symbol)
             self.last_prices[symbol] = bar["close"]
@@ -103,8 +114,21 @@ class BacktestEngine:
 
             self.last_prices[symbol] = current_bar["close"]
 
+            # 更新基准持仓（买入持有策略：首日用一半资金买入，持有不动）
+            if benchmark_shares == 0 and i == 0:
+                open_price = current_bar["open"]
+                affordable = int(self.initial_cash * 0.5 / (open_price * (1 + self.commission)) / 100) * 100
+                if affordable > 0:
+                    cost = affordable * open_price * (1 + self.commission)
+                    benchmark_cash -= cost
+                    benchmark_shares = affordable
+            benchmark_value = benchmark_cash + benchmark_shares * current_bar["close"]
+            self.benchmark_curve.append({"date": current_bar["date"], "value": benchmark_value})
+
             # 检查止损
             self._check_stop_loss(symbol, next_bar["open"])
+            # 检查止盈
+            self._check_take_profit(symbol, next_bar["open"])
 
             # 执行上一根 bar 产生的信号
             if symbol in self.pending_signal:
@@ -116,16 +140,20 @@ class BacktestEngine:
             if signal != Signal.HOLD:
                 self.pending_signal[symbol] = signal
 
-            self.equity_curve.append({"date": current_bar["date"], "value": self.get_total_value()})
+            self.equity_curve.append({"date": current_bar["date"], "value": self.get_total_value(), "action": self._last_action})
+            self._last_action = None
 
         # 处理最后一根 bar
         last_bar = self._row_to_bar(bars[-1], symbol)
         self.last_prices[symbol] = last_bar["close"]
+        benchmark_value = benchmark_cash + benchmark_shares * last_bar["close"]
+        self.benchmark_curve.append({"date": last_bar["date"], "value": benchmark_value})
         if symbol in self.pending_signal:
             self._check_stop_loss(symbol, last_bar["open"])
+            self._check_take_profit(symbol, last_bar["open"])
             signal = self.pending_signal.pop(symbol)
             self._execute_signal(signal, last_bar, strategy)
-        self.equity_curve.append({"date": last_bar["date"], "value": self.get_total_value()})
+        self.equity_curve.append({"date": last_bar["date"], "value": self.get_total_value(), "action": self._last_action})
 
         if self.verbose:
             self._print_trades()
@@ -157,12 +185,33 @@ class BacktestEngine:
         if position <= 0:
             return
 
-        entry_price = self._get_entry_price(symbol)
+        entry_price = self.entry_prices.get(symbol, 0.0)
+        if entry_price <= 0:
+            entry_price = self._get_entry_price(symbol)
         if entry_price <= 0:
             return
 
         loss_ratio = (current_price - entry_price) / entry_price
         if loss_ratio <= -self.stop_loss:
+            self.pending_signal[symbol] = Signal.SELL
+
+    def _check_take_profit(self, symbol: str, current_price: float):
+        """检查是否触发止盈。"""
+        if self.take_profit <= 0 or symbol not in self.positions:
+            return
+
+        position = self.positions[symbol]
+        if position <= 0:
+            return
+
+        entry_price = self.entry_prices.get(symbol, 0.0)
+        if entry_price <= 0:
+            entry_price = self._get_entry_price(symbol)
+        if entry_price <= 0:
+            return
+
+        gain_ratio = (current_price - entry_price) / entry_price
+        if gain_ratio >= self.take_profit:
             self.pending_signal[symbol] = Signal.SELL
 
     def _get_entry_price(self, symbol: str) -> float:
@@ -181,20 +230,127 @@ class BacktestEngine:
         return self.cash + positions_value
 
     def get_summary(self, symbol: str) -> dict:
-        """返回标准化回测结果。"""
+        """返回标准化回测结果（含增强指标）。"""
         final_value = self.get_total_value()
         profit = final_value - self.initial_cash
         profit_pct = profit / self.initial_cash * 100 if self.initial_cash else 0.0
+
+        # 计算最大回撤
+        max_drawdown, max_drawdown_pct = self._calc_max_drawdown()
+
+        # 计算年化收益率
+        annual_return = self._calc_annual_return(profit_pct)
+
+        # 计算夏普比率
+        sharpe = self._calc_sharpe_ratio()
+
+        # 计算基准收益
+        benchmark_return = 0.0
+        if self.benchmark_curve:
+            benchmark_start = self.benchmark_curve[0]["value"]
+            benchmark_end = self.benchmark_curve[-1]["value"]
+            benchmark_return = (benchmark_end - benchmark_start) / benchmark_start * 100 if benchmark_start else 0.0
+
+        # 策略相对基准收益
+        alpha = profit_pct - benchmark_return
+
+        # 交易统计
+        trades = len(self.trades)
+        buy_trades = [t for t in self.trades if t["action"] == "BUY"]
+        sell_trades = [t for t in self.trades if t["action"] == "SELL"]
+        win_trades = 0
+        total_profit = 0.0
+        total_loss = 0.0
+        for i in range(0, len(sell_trades)):
+            if i < len(buy_trades):
+                buy_price = buy_trades[i]["price"]
+                sell_price = sell_trades[i]["price"]
+                pnl = (sell_price - buy_price) * sell_trades[i]["quantity"]
+                if pnl > 0:
+                    win_trades += 1
+                    total_profit += pnl
+                else:
+                    total_loss += abs(pnl)
+        win_rate = win_trades / len(sell_trades) * 100 if sell_trades else 0.0
+        avg_win = total_profit / win_trades if win_trades else 0.0
+        avg_loss = total_loss / (len(sell_trades) - win_trades) if sell_trades and len(sell_trades) > win_trades else 0.0
+        profit_factor = total_profit / total_loss if total_loss > 0 else float("inf") if total_profit > 0 else 0.0
+
         return {
             "symbol": symbol,
             "final_value": final_value,
             "profit": profit,
             "profit_pct": profit_pct,
-            "trades": len(self.trades),
+            "annual_return": annual_return,
+            "benchmark_return": benchmark_return,
+            "alpha": alpha,
+            "max_drawdown": max_drawdown,
+            "max_drawdown_pct": max_drawdown_pct,
+            "sharpe_ratio": sharpe,
+            "trades": trades,
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": profit_factor,
             "cash": self.cash,
             "positions": dict(self.positions),
             "last_prices": dict(self.last_prices),
+            "equity_curve": self.equity_curve,
+            "benchmark_curve": self.benchmark_curve,
+            "trades_list": list(self.trades),
         }
+
+    def _calc_max_drawdown(self):
+        """计算最大回撤。"""
+        if not self.equity_curve:
+            return 0.0, 0.0
+        values = [e["value"] for e in self.equity_curve]
+        peak = values[0]
+        max_dd = 0.0
+        max_dd_pct = 0.0
+        for v in values:
+            if v > peak:
+                peak = v
+            dd = peak - v
+            dd_pct = dd / peak * 100 if peak > 0 else 0.0
+            if dd > max_dd:
+                max_dd = dd
+                max_dd_pct = dd_pct
+        return max_dd, max_dd_pct
+
+    def _calc_annual_return(self, profit_pct: float) -> float:
+        """基于回测天数估算年化收益率。"""
+        if not self.equity_curve or len(self.equity_curve) < 2:
+            return 0.0
+        days = len(self.equity_curve)
+        years = days / 244  # A股每年约244个交易日
+        if years < 0.01:
+            return 0.0
+        # 几何年化
+        total_return = self.equity_curve[-1]["value"] / self.equity_curve[0]["value"]
+        annual = (total_return ** (1 / years) - 1) * 100 if total_return > 0 else 0.0
+        return annual
+
+    def _calc_sharpe_ratio(self) -> float:
+        """计算夏普比率（简单版：无风险利率=0）。"""
+        if len(self.equity_curve) < 10:
+            return 0.0
+        values = [e["value"] for e in self.equity_curve]
+        # 日收益率
+        returns = []
+        for i in range(1, len(values)):
+            if values[i - 1] > 0:
+                ret = (values[i] - values[i - 1]) / values[i - 1]
+                returns.append(ret)
+        if not returns:
+            return 0.0
+        mean_ret = sum(returns) / len(returns)
+        std_ret = math.sqrt(sum((r - mean_ret) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.0
+        if std_ret == 0:
+            return 0.0
+        # 年化夏普（244交易日）
+        sharpe = (mean_ret / std_ret) * math.sqrt(244)
+        return sharpe
 
     def _execute_signal(self, signal: str, bar: dict, strategy):
         """执行交易信号（以 bar 的 open 价格成交，消除 look-ahead bias）。"""
@@ -214,6 +370,7 @@ class BacktestEngine:
             cost = affordable_quantity * price * (1 + self.commission)
             self.cash -= cost
             self.positions[symbol] = position + affordable_quantity
+            self.entry_prices[symbol] = price  # 记录入场价
             strategy.set_position(symbol, self.positions[symbol])
             trade = {
                 "date": bar["date"],
@@ -223,6 +380,7 @@ class BacktestEngine:
                 "quantity": affordable_quantity,
             }
             self.trades.append(trade)
+            self._last_action = "buy"
             if self.verbose:
                 self._print_trade(trade)
             return
@@ -240,6 +398,7 @@ class BacktestEngine:
                 "quantity": position,
             }
             self.trades.append(trade)
+            self._last_action = "sell"
             if self.verbose:
                 self._print_trade(trade)
 
@@ -262,7 +421,7 @@ class BacktestEngine:
             print(f"  {index}. [{date_str}] {action}: {trade['quantity']}股 @ {trade['price']:.2f}")
 
     def _print_summary(self, summary: dict):
-        """打印回测结果。"""
+        """打印回测结果（含增强指标）。"""
         position_snapshot = {
             symbol: {
                 "quantity": quantity,
@@ -274,7 +433,15 @@ class BacktestEngine:
         print("\n===== 回测结果 =====")
         print(f"初始资金: {self.initial_cash:,.2f}")
         print(f"最终价值: {summary['final_value']:,.2f}")
-        print(f"收益率: {summary['profit_pct']:.2f}%")
-        print(f"交易次数: {summary['trades']}")
-        print(f"剩余现金: {summary['cash']:,.2f}")
+        print(f"收益率:   {summary['profit_pct']:+.2f}%")
+        print(f"年化收益: {summary.get('annual_return', 0):+.2f}%")
+        print(f"基准收益: {summary.get('benchmark_return', 0):+.2f}%  (买入持有)")
+        print(f"Alpha:   {summary.get('alpha', 0):+.2f}%  (相对基准)")
+        print(f"最大回撤: {summary.get('max_drawdown', 0):,.2f}  ({summary.get('max_drawdown_pct', 0):.2f}%)")
+        print(f"夏普比率: {summary.get('sharpe_ratio', 0):.2f}")
+        print(f"交易次数: {summary.get('trades', 0)}")
+        print(f"胜率:     {summary.get('win_rate', 0):.1f}%")
+        print(f"盈亏比:   {summary.get('avg_win', 0):.2f} / {summary.get('avg_loss', 0):.2f}")
+        print(f"盈利因子: {summary.get('profit_factor', 0):.2f}")
+        print(f"剩余现金: {summary.get('cash', 0):,.2f}")
         print(f"持仓: {position_snapshot}")
