@@ -490,9 +490,13 @@ def run_simulate(args, config, logger):
     print(f"策略信号: {signal}")
 
     if signal == "buy":
-        success = broker.buy(symbol, data["last_price"], 1000, data["timestamp"])
-        if success:
-            print(f"模拟买入成功: 1000股 @ {data['last_price']}")
+        lot_size = 100
+        price = data["last_price"]
+        affordable = int(broker.get_cash() * 0.5 / (price * (1 + broker.commission)) / lot_size) * lot_size
+        if affordable > 0:
+            success = broker.buy(symbol, price, affordable, data["timestamp"])
+            if success:
+                print(f"模拟买入成功: {affordable}股 @ {price:.2f}")
 
     broker.print_status()
     print(f"总资产: {broker.get_total_value(prices):,.2f}")
@@ -511,7 +515,11 @@ def run_realtime(args, config, logger):
         print(f"[{bar['timestamp']}] {current_symbol}: {bar['last_price']}, 信号: {signal}")
 
         if signal == "buy" and broker.get_position(current_symbol) == 0:
-            broker.buy(current_symbol, bar["last_price"], 1000, bar["timestamp"])
+            lot_size = 100
+            price = bar["last_price"]
+            affordable = int(broker.get_cash() * 0.5 / (price * (1 + broker.commission)) / lot_size) * lot_size
+            if affordable > 0:
+                broker.buy(current_symbol, price, affordable, bar["timestamp"])
         elif signal == "sell" and broker.get_position(current_symbol) > 0:
             broker.sell(
                 current_symbol,

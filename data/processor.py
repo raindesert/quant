@@ -42,3 +42,13 @@ class DataProcessor:
         rs = avg_gain / avg_loss
         df["rsi"] = 100 - (100 / (1 + rs))
         return df
+
+    @staticmethod
+    def add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+        df = df.copy()
+        ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
+        ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
+        df["macd_dif"] = ema_fast - ema_slow
+        df["macd_dea"] = df["macd_dif"].ewm(span=signal, adjust=False).mean()
+        df["macd_hist"] = (df["macd_dif"] - df["macd_dea"]) * 2
+        return df

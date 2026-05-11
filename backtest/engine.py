@@ -120,11 +120,15 @@ class BacktestEngine(BaseBacktestEngine):
         self.last_prices[symbol] = last_bar["close"]
         benchmark_value = benchmark_cash + benchmark_shares * last_bar["close"]
         self.benchmark_curve.append({"date": last_bar["date"], "value": benchmark_value})
+
         if symbol in self.pending_signal:
             self._check_stop_loss(symbol, last_bar["open"], self.pending_signal)
             self._check_take_profit(symbol, last_bar["open"], self.pending_signal)
             signal = self.pending_signal.pop(symbol)
             self._execute_signal(signal, last_bar, strategy)
+
+        strategy.on_bar(last_bar)
+
         self.equity_curve.append({"date": last_bar["date"], "value": self.get_total_value(), "action": self._last_action})
 
         if self.verbose:
@@ -150,9 +154,15 @@ class BacktestEngine(BaseBacktestEngine):
             if cost > self.cash:
                 return
             self.cash -= cost
-            self.positions[symbol] = position + affordable_quantity
-            self.entry_prices[symbol] = price
-            strategy.set_position(symbol, self.positions[symbol])
+            old_qty = self.positions.get(symbol, 0)
+            new_qty = old_qty + affordable_quantity
+            self.positions[symbol] = new_qty
+            if old_qty > 0:
+                old_entry = self.entry_prices.get(symbol, price)
+                self.entry_prices[symbol] = (old_entry * old_qty + price * affordable_quantity) / new_qty
+            else:
+                self.entry_prices[symbol] = price
+            strategy.set_position(symbol, new_qty)
             commission_cost = max(price * affordable_quantity * self.commission, self.min_commission)
             trade = {
                 "date": bar["date"],
@@ -160,6 +170,7 @@ class BacktestEngine(BaseBacktestEngine):
                 "action": "BUY",
                 "price": price,
                 "quantity": affordable_quantity,
+                "entry_price": self.entry_prices[symbol],
                 "commission_cost": commission_cost,
             }
             self.trades.append(trade)
@@ -172,6 +183,7 @@ class BacktestEngine(BaseBacktestEngine):
             proceeds = self._calc_sell_proceeds(price, position)
             commission_cost = max(price * position * self.commission, self.min_commission)
             stamp_cost = price * position * self.stamp_tax
+            entry_price = self.entry_prices.get(symbol, price)
             self.cash += proceeds
             self.positions.pop(symbol, None)
             self.entry_prices.pop(symbol, None)
@@ -182,6 +194,7 @@ class BacktestEngine(BaseBacktestEngine):
                 "action": "SELL",
                 "price": price,
                 "quantity": position,
+                "entry_price": entry_price,
                 "commission_cost": commission_cost + stamp_cost,
             }
             self.trades.append(trade)

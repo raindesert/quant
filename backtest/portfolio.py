@@ -169,6 +169,9 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 sig = self.pending_signal.pop(sym)
                 self._execute_signal(sig, last_bars[sym], strategies[sym])
 
+        for sym, bar in last_bars.items():
+            strategies[sym].on_bar(bar)
+
         combined_val = self.get_total_value()
         self.equity_curve.append({
             "date": last_date,
@@ -203,9 +206,15 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
             if cost > self.cash:
                 return
             self.cash -= cost
-            self.positions[symbol] = position + affordable
-            self.entry_prices[symbol] = price
-            strategy.set_position(symbol, self.positions[symbol])
+            old_qty = self.positions.get(symbol, 0)
+            new_qty = old_qty + affordable
+            self.positions[symbol] = new_qty
+            if old_qty > 0:
+                old_entry = self.entry_prices.get(symbol, price)
+                self.entry_prices[symbol] = (old_entry * old_qty + price * affordable) / new_qty
+            else:
+                self.entry_prices[symbol] = price
+            strategy.set_position(symbol, new_qty)
             commission_cost = max(price * affordable * self.commission, self.min_commission)
             self.trades.append({
                 "date": bar["date"],
@@ -213,6 +222,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 "action": "BUY",
                 "price": price,
                 "quantity": affordable,
+                "entry_price": self.entry_prices[symbol],
                 "commission_cost": commission_cost,
             })
             if self.verbose:
@@ -223,6 +233,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
             proceeds = self._calc_sell_proceeds(price, position)
             commission_cost = max(price * position * self.commission, self.min_commission)
             stamp_cost = price * position * self.stamp_tax
+            entry_price = self.entry_prices.get(symbol, price)
             self.cash += proceeds
             self.positions.pop(symbol, None)
             self.entry_prices.pop(symbol, None)
@@ -233,6 +244,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 "action": "SELL",
                 "price": price,
                 "quantity": position,
+                "entry_price": entry_price,
                 "commission_cost": commission_cost + stamp_cost,
             })
             if self.verbose:
@@ -256,7 +268,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
             sym_sell = [t for t in sym_trades if t["action"] == "SELL"]
             sym_wins = 0
             for t in sym_sell:
-                entry_price = self.entry_prices.get(sym, 0.0)
+                entry_price = t.get("entry_price", 0.0)
                 pnl = (t["price"] - entry_price) * t["quantity"]
                 if pnl > 0:
                     sym_wins += 1

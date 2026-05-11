@@ -12,6 +12,7 @@ class BaseBacktestEngine:
     """
 
     TRADING_DAYS_PER_YEAR = 244
+    RISK_FREE_RATE_DAILY = 0.03 / 244
 
     def __init__(
         self,
@@ -133,11 +134,12 @@ class BaseBacktestEngine:
                 returns.append(ret)
         if not returns:
             return 0.0
-        mean_ret = sum(returns) / len(returns)
-        std_ret = math.sqrt(sum((r - mean_ret) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.0
-        if std_ret == 0:
+        excess_returns = [r - self.RISK_FREE_RATE_DAILY for r in returns]
+        mean_excess = sum(excess_returns) / len(excess_returns)
+        std_ret = math.sqrt(sum((r - mean_excess) ** 2 for r in excess_returns) / len(excess_returns)) if len(excess_returns) > 1 else 0.0
+        if std_ret < 1e-10:
             return 0.0
-        return (mean_ret / std_ret) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
+        return (mean_excess / std_ret) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
 
     def _calc_benchmark_return(self) -> float:
         if not self.benchmark_curve:
@@ -152,7 +154,7 @@ class BaseBacktestEngine:
         total_profit = 0.0
         total_loss = 0.0
         for t in sell_trades:
-            entry_price = self.entry_prices.get(t["symbol"], 0.0)
+            entry_price = t.get("entry_price", 0.0)
             pnl = (t["price"] - entry_price) * t["quantity"] - t.get("commission_cost", 0.0)
             if pnl > 0:
                 win_trades += 1

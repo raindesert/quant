@@ -24,14 +24,13 @@ plt.rcParams["axes.unicode_minus"] = False
 
 
 def export_trades_csv(trades: list[dict], path: str | Path):
-    """将交易记录导出为 CSV 文件。"""
     if not trades:
         return
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fieldnames = ["date", "symbol", "action", "price", "quantity", "commission"]
+    fieldnames = ["date", "symbol", "action", "price", "quantity", "entry_price", "commission_cost"]
     rows = []
     for t in trades:
         date_str = t["date"].strftime("%Y-%m-%d") if hasattr(t["date"], "strftime") else str(t["date"])
@@ -41,7 +40,8 @@ def export_trades_csv(trades: list[dict], path: str | Path):
             "action": t.get("action", ""),
             "price": f"{t.get('price', 0):.4f}",
             "quantity": t.get("quantity", 0),
-            "commission": f"{t.get('commission', 0):.4f}",
+            "entry_price": f"{t.get('entry_price', 0):.4f}",
+            "commission_cost": f"{t.get('commission_cost', 0):.4f}",
         })
 
     with open(path, "w", newline="", encoding="utf-8") as f:

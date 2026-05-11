@@ -85,38 +85,49 @@ class DataFetcher:
         raise RuntimeError(f"无法获取 {symbol} 历史数据，所有数据源均失败")
 
     def _fetch_from_baostock(self, symbol: str, days: int) -> pd.DataFrame:
-        bs.login()
-        try:
-            code = self._to_baostock_code(symbol)
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                bs.login()
+                code = self._to_baostock_code(symbol)
+                end_date = datetime.now().strftime("%Y-%m-%d")
+                start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-            rs = bs.query_history_k_data_plus(
-                code,
-                "date,open,close,high,low,volume,amount",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="2",
-            )
-            if rs.error_code != "0":
-                raise RuntimeError(f"baostock error: {rs.error_msg}")
+                rs = bs.query_history_k_data_plus(
+                    code,
+                    "date,open,close,high,low,volume,amount",
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency="d",
+                    adjustflag="2",
+                )
+                if rs.error_code != "0":
+                    raise RuntimeError(f"baostock error: {rs.error_msg}")
 
-            data = rs.data
-            if not data or len(data) == 0:
-                return pd.DataFrame()
+                data = rs.data
+                if not data or len(data) == 0:
+                    return pd.DataFrame()
 
-            df = pd.DataFrame(
-                data,
-                columns=["date", "open", "close", "high", "low", "volume", "amount"],
-            )
-            for col in ["open", "close", "high", "low", "volume", "amount"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["date"] = pd.to_datetime(df["date"])
-            df["turnover"] = 0.0
-            return df.dropna().sort_values("date").reset_index(drop=True)
-        finally:
-            bs.logout()
+                df = pd.DataFrame(
+                    data,
+                    columns=["date", "open", "close", "high", "low", "volume", "amount"],
+                )
+                for col in ["open", "close", "high", "low", "volume", "amount"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df["date"] = pd.to_datetime(df["date"])
+                df["turnover"] = 0.0
+                return df.dropna().sort_values("date").reset_index(drop=True)
+            except Exception as exc:
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+        return pd.DataFrame()
 
     def _fetch_from_tencent(self, symbol: str, days: int) -> pd.DataFrame:
         end_date = datetime.now().strftime("%Y-%m-%d")
