@@ -147,7 +147,7 @@ def plot_monthly_heatmap(summary):
         z=pivot.values,
         x=pivot.columns,
         y=[str(y) for y in pivot.index],
-        colorscale=[["#388e3c", "#fff"], ["#fff", "#d32f2f"]],
+        colorscale=[[0, "#388e3c"], [0.5, "#fff"], [1, "#d32f2f"]],
         zmid=0,
         text=np.round(pivot.values, 2),
         texttemplate="%{text}%",
