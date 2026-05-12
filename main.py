@@ -8,7 +8,14 @@ from pathlib import Path
 import yaml
 
 from backtest.engine import BacktestEngine
-from backtest.output import export_summary_json, export_trades_csv, plot_drawdown_curve, plot_equity_curve
+from backtest.output import (
+    export_summary_json,
+    export_trades_csv,
+    plot_drawdown_curve,
+    plot_equity_curve,
+    plot_monthly_heatmap,
+    plot_strategy_comparison,
+)
 from backtest.portfolio import PortfolioBacktestEngine
 from backtest.optimizer import StrategyOptimizer, DEFAULT_GRIDS, OPTIMIZE_METRICS
 from backtest.walk_forward import WalkForwardValidator
@@ -85,12 +92,22 @@ STRATEGIES = {
 }
 
 
-def get_strategy(strategy_name: str):
-    """根据名称创建策略实例。"""
+def get_strategy(strategy_name: str, symbol: str = "", load_params: bool = False):
+    """根据名称创建策略实例，支持加载已保存的参数。"""
     strategy_cls = STRATEGIES.get(strategy_name.lower())
     if strategy_cls is None:
         print(f"未知策略: {strategy_name}，将使用默认策略 SMA")
         return SMAStrategy()
+
+    if load_params and symbol:
+        from strategy.params import load_params as _load_params
+        saved = _load_params(strategy_name, symbol=symbol)
+        if saved:
+            try:
+                return strategy_cls(**saved)
+            except Exception:
+                pass
+
     return strategy_cls()
 
 
@@ -186,8 +203,12 @@ def export_results(args, summary: dict, symbol: str):
         chart_dir = Path(args.chart)
         equity_path = chart_dir / f"{symbol}_equity.png"
         drawdown_path = chart_dir / f"{symbol}_drawdown.png"
+        heatmap_path = chart_dir / f"{symbol}_monthly.png"
         plot_equity_curve(equity_curve, benchmark_curve, symbol, equity_path, summary=summary)
         plot_drawdown_curve(equity_curve, symbol, drawdown_path)
+        monthly = summary.get("monthly_returns", {})
+        if monthly:
+            plot_monthly_heatmap(monthly, symbol, heatmap_path)
 
 
 
@@ -231,6 +252,11 @@ def run_optimize(args, config, logger):
         logger.error("无法确定参数网格，请使用 --param 指定，如: --param fast=5,10 --param slow=30,60")
         return
 
+    risk_manager = build_risk_manager(args, config)
+    risk_params = None
+    if risk_manager is not None:
+        risk_params = risk_manager.get_status()
+
     optimizer = StrategyOptimizer(
         strategy_name=strategy_name,
         symbol=symbol,
@@ -243,11 +269,23 @@ def run_optimize(args, config, logger):
         end_date=end_date,
         metric=metric,
         workers=workers,
+        risk_params=risk_params,
     )
 
     result = optimizer.optimize(param_grid)
     if result["all_results"]:
         optimizer.print_leaderboard(result["all_results"], top=args.optimize_top or 10)
+
+    if result.get("best_params"):
+        from strategy.params import save_params
+        save_params(
+            strategy_name=strategy_name,
+            params=result["best_params"],
+            symbol=symbol,
+            score=result.get("best_score"),
+            metric=metric,
+        )
+        print(f"\n最优参数已自动保存到 params/{strategy_name}_{symbol}.json")
 
     if args.output_json:
         import json
@@ -459,6 +497,15 @@ def run_backtest(args, config, logger):
                 wins = sum(1 for p in profits if p > 0)
                 win_rate = wins / len(profits) * 100
                 print(f"{s:<15s} {avg:+10.2f}% {avg_alpha:+10.2f}% {avg_dd:>12.2f}% {avg_sharpe:>10.2f} {win_rate:>7.1f}%")
+
+        if args.chart and all_results:
+            for r in all_results:
+                if r["results"]:
+                    chart_dir = Path(args.chart)
+                    plot_strategy_comparison(
+                        r["results"],
+                        chart_dir / f"{r['symbol']}_strategy_comparison.png",
+                    )
         return
 
     results = []
@@ -501,8 +548,13 @@ def run_backtest(args, config, logger):
                 check_limit=check_limit,
                 risk_manager=risk_manager,
             )
+            strategy = get_strategy(
+                strategy_name,
+                symbol=symbol,
+                load_params=getattr(args, "load_params", False),
+            )
             summary = engine.run(
-                get_strategy(strategy_name),
+                strategy,
                 symbol,
                 days=days,
                 start_date=start_date,
@@ -715,6 +767,7 @@ def main():
     parser.add_argument("--optimize-metric", default="sharpe_ratio", choices=["profit_pct", "sharpe_ratio", "profit_factor", "max_drawdown_pct", "win_rate"], help="优化目标指标")
     parser.add_argument("--optimize-top", type=int, default=10, help="排行榜显示前N名（默认10）")
     parser.add_argument("--optimize-workers", type=int, default=4, help="并发进程数（默认4）")
+    parser.add_argument("--load-params", action="store_true", help="加载已保存的最优参数（回测时自动加载 params/ 目录下对应参数）")
 
     risk_group = parser.add_argument_group("风控参数")
     risk_group.add_argument("--no-risk", action="store_true", help="禁用风控模块")

@@ -248,3 +248,127 @@ def plot_drawdown_curve(
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"回撤曲线图已保存: {output_path}")
+
+
+def plot_monthly_heatmap(
+    monthly_returns: dict[str, float],
+    symbol: str,
+    output_path: str | Path,
+):
+    if not monthly_returns:
+        print("无月度收益数据，跳过热力图")
+        return
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame(
+        [(k, v) for k, v in monthly_returns.items()],
+        columns=["month", "return"]
+    )
+    df["year"] = df["month"].str[:4].astype(int)
+    df["month_num"] = df["month"].str[5:7].astype(int)
+
+    pivot = df.pivot(index="year", columns="month_num", values="return")
+    pivot = pivot.reindex(columns=range(1, 13))
+    pivot.columns = ["1月", "2月", "3月", "4月", "5月", "6月",
+                     "7月", "8月", "9月", "10月", "11月", "12月"]
+
+    fig, ax = plt.subplots(figsize=(14, max(3, len(pivot) * 0.6)), facecolor=_COLORS["bg"])
+    ax.set_facecolor(_COLORS["bg"])
+
+    vmax = max(abs(pivot.min().min()), abs(pivot.max().max()), 1.0)
+    im = ax.imshow(pivot.values, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
+
+    for i in range(len(pivot)):
+        for j in range(12):
+            val = pivot.iloc[i, j]
+            if not pd.isna(val):
+                color = "white" if abs(val) > vmax * 0.5 else "black"
+                ax.text(j, i, f"{val:+.1f}%", ha="center", va="center", fontsize=9, color=color)
+
+    ax.set_xticks(range(12))
+    ax.set_xticklabels(pivot.columns)
+    ax.set_yticks(range(len(pivot)))
+    ax.set_yticklabels(pivot.index)
+
+    ax.set_title(f"{symbol} 月度收益热力图", fontsize=14, fontweight="bold")
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("收益率 (%)", fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"月度收益热力图已保存: {output_path}")
+
+
+def plot_strategy_comparison(
+    results: list[dict],
+    output_path: str | Path,
+):
+    if not results:
+        return
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12), facecolor=_COLORS["bg"])
+
+    names = [r.get("strategy", "") for r in results]
+    profits = [r.get("profit_pct", 0) for r in results]
+    sharpes = [r.get("sharpe_ratio", 0) for r in results]
+    max_dds = [r.get("max_drawdown_pct", 0) for r in results]
+    trades = [r.get("trades", 0) for r in results]
+    win_rates = [r.get("win_rate", 0) for r in results]
+
+    colors = plt.cm.tab10(range(len(names)))
+
+    ax = axes[0, 0]
+    bars = ax.bar(names, profits, color=colors, edgecolor="white", linewidth=0.5)
+    ax.axhline(y=0, color="black", linewidth=0.5)
+    ax.set_title("收益率对比", fontsize=12, fontweight="bold")
+    ax.set_ylabel("收益率 (%)")
+    for bar, val in zip(bars, profits):
+        ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:+.1f}%",
+                ha="center", va="bottom" if val >= 0 else "top", fontsize=9)
+
+    ax = axes[0, 1]
+    bars = ax.bar(names, sharpes, color=colors, edgecolor="white", linewidth=0.5)
+    ax.axhline(y=0, color="black", linewidth=0.5)
+    ax.set_title("夏普比率对比", fontsize=12, fontweight="bold")
+    ax.set_ylabel("夏普比率")
+    for bar, val in zip(bars, sharpes):
+        ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:.2f}",
+                ha="center", va="bottom" if val >= 0 else "top", fontsize=9)
+
+    ax = axes[1, 0]
+    bars = ax.bar(names, max_dds, color=colors, edgecolor="white", linewidth=0.5)
+    ax.set_title("最大回撤对比", fontsize=12, fontweight="bold")
+    ax.set_ylabel("回撤 (%)")
+    for bar, val in zip(bars, max_dds):
+        ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:.1f}%",
+                ha="center", va="bottom", fontsize=9)
+
+    ax = axes[1, 1]
+    x = range(len(names))
+    width = 0.35
+    ax.bar([i - width / 2 for i in x], trades, width, label="交易次数", color=colors, alpha=0.7)
+    ax2 = ax.twinx()
+    ax2.bar([i + width / 2 for i in x], win_rates, width, label="胜率", color=colors, alpha=0.4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names)
+    ax.set_title("交易次数与胜率", fontsize=12, fontweight="bold")
+    ax.set_ylabel("交易次数")
+    ax2.set_ylabel("胜率 (%)")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+
+    for ax in axes.flat:
+        ax.set_facecolor(_COLORS["bg"])
+        ax.grid(True, alpha=0.2)
+
+    plt.suptitle("策略对比分析", fontsize=16, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"策略对比图已保存: {output_path}")

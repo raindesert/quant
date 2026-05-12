@@ -225,6 +225,134 @@ class BaseBacktestEngine:
         end = self.benchmark_curve[-1]["value"]
         return (end - start) / start * 100 if start else 0.0
 
+    def _calc_beta(self) -> float:
+        if len(self.equity_curve) < 10 or not self.benchmark_curve:
+            return 0.0
+        strategy_returns = []
+        benchmark_returns = []
+        for i in range(1, len(self.equity_curve)):
+            s_prev = self.equity_curve[i - 1]["value"]
+            s_curr = self.equity_curve[i]["value"]
+            if s_prev > 0:
+                strategy_returns.append((s_curr - s_prev) / s_prev)
+            bm_date = self.equity_curve[i]["date"]
+            bm_prev = next((b["value"] for b in self.benchmark_curve if b["date"] == self.equity_curve[i - 1]["date"]), None)
+            bm_curr = next((b["value"] for b in self.benchmark_curve if b["date"] == bm_date), None)
+            if bm_prev and bm_prev > 0 and bm_curr:
+                benchmark_returns.append((bm_curr - bm_prev) / bm_prev)
+        if len(strategy_returns) != len(benchmark_returns) or len(strategy_returns) < 2:
+            return 0.0
+        n = len(strategy_returns)
+        mean_s = sum(strategy_returns) / n
+        mean_b = sum(benchmark_returns) / n
+        cov = sum((strategy_returns[i] - mean_s) * (benchmark_returns[i] - mean_b) for i in range(n)) / n
+        var_b = sum((benchmark_returns[i] - mean_b) ** 2 for i in range(n)) / n
+        if var_b < 1e-10:
+            return 0.0
+        return cov / var_b
+
+    def _calc_information_ratio(self) -> float:
+        if len(self.equity_curve) < 10 or not self.benchmark_curve:
+            return 0.0
+        strategy_returns = []
+        benchmark_returns = []
+        for i in range(1, len(self.equity_curve)):
+            s_prev = self.equity_curve[i - 1]["value"]
+            s_curr = self.equity_curve[i]["value"]
+            if s_prev > 0:
+                strategy_returns.append((s_curr - s_prev) / s_prev)
+            bm_date = self.equity_curve[i]["date"]
+            bm_prev = next((b["value"] for b in self.benchmark_curve if b["date"] == self.equity_curve[i - 1]["date"]), None)
+            bm_curr = next((b["value"] for b in self.benchmark_curve if b["date"] == bm_date), None)
+            if bm_prev and bm_prev > 0 and bm_curr:
+                benchmark_returns.append((bm_curr - bm_prev) / bm_prev)
+        if len(strategy_returns) != len(benchmark_returns) or len(strategy_returns) < 2:
+            return 0.0
+        n = len(strategy_returns)
+        excess = [strategy_returns[i] - benchmark_returns[i] for i in range(n)]
+        mean_excess = sum(excess) / n
+        std_excess = math.sqrt(sum((e - mean_excess) ** 2 for e in excess) / n) if n > 1 else 0.0
+        if std_excess < 1e-10:
+            return 0.0
+        return (mean_excess / std_excess) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
+
+    def _calc_annual_volatility(self) -> float:
+        if len(self.equity_curve) < 10:
+            return 0.0
+        values = [e["value"] for e in self.equity_curve]
+        returns = []
+        for i in range(1, len(values)):
+            if values[i - 1] > 0:
+                returns.append((values[i] - values[i - 1]) / values[i - 1])
+        if not returns:
+            return 0.0
+        std_ret = math.sqrt(sum((r - sum(returns) / len(returns)) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.0
+        return std_ret * math.sqrt(self.TRADING_DAYS_PER_YEAR) * 100
+
+    def _calc_calmar_ratio(self) -> float:
+        annual_return = self._calc_annual_return()
+        _, max_dd_pct = self._calc_max_drawdown()
+        if max_dd_pct <= 0:
+            return 0.0
+        return annual_return / max_dd_pct
+
+    def _calc_sortino_ratio(self) -> float:
+        if len(self.equity_curve) < 10:
+            return 0.0
+        values = [e["value"] for e in self.equity_curve]
+        returns = []
+        for i in range(1, len(values)):
+            if values[i - 1] > 0:
+                returns.append((values[i] - values[i - 1]) / values[i - 1])
+        if not returns:
+            return 0.0
+        excess_returns = [r - self.RISK_FREE_RATE_DAILY for r in returns]
+        mean_excess = sum(excess_returns) / len(excess_returns)
+        downside_returns = [r for r in returns if r < 0]
+        downside_std = math.sqrt(sum(r ** 2 for r in downside_returns) / len(returns)) if downside_returns else 0.0
+        if downside_std < 1e-10:
+            return 0.0
+        return (mean_excess / downside_std) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
+
+    def _calc_monthly_returns(self) -> dict:
+        if not self.equity_curve:
+            return {}
+        monthly = {}
+        for e in self.equity_curve:
+            try:
+                month_key = e["date"].strftime("%Y-%m")
+            except Exception:
+                continue
+            if month_key not in monthly:
+                monthly[month_key] = {"start": e["value"], "end": e["value"]}
+            monthly[month_key]["end"] = e["value"]
+
+        result = {}
+        for month, data in monthly.items():
+            if data["start"] > 0:
+                result[month] = (data["end"] - data["start"]) / data["start"] * 100
+        return result
+
+    def _calc_quantile_stats(self) -> dict:
+        if not self.equity_curve or len(self.equity_curve) < 2:
+            return {}
+        values = [e["value"] for e in self.equity_curve]
+        returns = []
+        for i in range(1, len(values)):
+            if values[i - 1] > 0:
+                returns.append((values[i] - values[i - 1]) / values[i - 1] * 100)
+        if not returns:
+            return {}
+        sorted_returns = sorted(returns)
+        n = len(sorted_returns)
+        return {
+            "best_day": sorted_returns[-1] if n > 0 else 0.0,
+            "worst_day": sorted_returns[0] if n > 0 else 0.0,
+            "p25": sorted_returns[n // 4] if n > 3 else 0.0,
+            "p50": sorted_returns[n // 2] if n > 1 else 0.0,
+            "p75": sorted_returns[n * 3 // 4] if n > 3 else 0.0,
+        }
+
     def _calc_trade_stats(self) -> dict:
         sell_trades = [t for t in self.trades if t["action"] == "SELL"]
         win_trades = 0
@@ -280,4 +408,9 @@ class BaseBacktestEngine:
             "total_stamp_tax": total_stamp_tax,
             "total_slippage_cost": total_slippage_cost,
             "avg_holding_days": avg_holding_days,
+            "annual_volatility": self._calc_annual_volatility(),
+            "calmar_ratio": self._calc_calmar_ratio(),
+            "sortino_ratio": self._calc_sortino_ratio(),
+            "monthly_returns": self._calc_monthly_returns(),
+            "quantile_stats": self._calc_quantile_stats(),
         }

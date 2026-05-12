@@ -290,6 +290,8 @@ class BacktestEngine(BaseBacktestEngine):
         sharpe = self._calc_sharpe_ratio()
         benchmark_return = self._calc_benchmark_return()
         alpha = profit_pct - benchmark_return
+        beta = self._calc_beta()
+        info_ratio = self._calc_information_ratio()
         stats = self._calc_trade_stats()
 
         return {
@@ -300,6 +302,8 @@ class BacktestEngine(BaseBacktestEngine):
             "annual_return": annual_return,
             "benchmark_return": benchmark_return,
             "alpha": alpha,
+            "beta": beta,
+            "information_ratio": info_ratio,
             "max_drawdown": max_drawdown,
             "max_drawdown_pct": max_drawdown_pct,
             "sharpe_ratio": sharpe,
@@ -328,8 +332,13 @@ class BacktestEngine(BaseBacktestEngine):
         print(f"年化收益: {summary.get('annual_return', 0):+.2f}%")
         print(f"基准收益: {summary.get('benchmark_return', 0):+.2f}%  (买入持有)")
         print(f"Alpha:   {summary.get('alpha', 0):+.2f}%  (相对基准)")
+        print(f"Beta:    {summary.get('beta', 0):.2f}")
+        print(f"信息比率: {summary.get('information_ratio', 0):.2f}")
         print(f"最大回撤: {summary.get('max_drawdown', 0):,.2f}  ({summary.get('max_drawdown_pct', 0):.2f}%)")
         print(f"夏普比率: {summary.get('sharpe_ratio', 0):.2f}")
+        print(f"索提诺比: {summary.get('sortino_ratio', 0):.2f}")
+        print(f"Calmar比: {summary.get('calmar_ratio', 0):.2f}")
+        print(f"年化波动: {summary.get('annual_volatility', 0):.2f}%")
         print(f"交易次数: {summary.get('trades', 0)}")
         print(f"胜率:     {summary.get('win_rate', 0):.1f}%")
         print(f"盈亏比:   {summary.get('avg_win', 0):.2f} / {summary.get('avg_loss', 0):.2f}")
@@ -340,3 +349,9 @@ class BacktestEngine(BaseBacktestEngine):
         print(f"平均持仓: {summary.get('avg_holding_days', 0):.1f} 天")
         print(f"剩余现金: {summary.get('cash', 0):,.2f}")
         print(f"持仓: {position_snapshot}")
+
+        qs = summary.get("quantile_stats", {})
+        if qs:
+            print(f"\n--- 日收益分位数 ---")
+            print(f"  最佳: {qs.get('best_day', 0):+.2f}%  最差: {qs.get('worst_day', 0):+.2f}%")
+            print(f"  P25: {qs.get('p25', 0):+.2f}%  P50: {qs.get('p50', 0):+.2f}%  P75: {qs.get('p75', 0):+.2f}%")

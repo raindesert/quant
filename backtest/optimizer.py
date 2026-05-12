@@ -47,9 +47,21 @@ OPTIMIZE_METRICS = {
 
 def _run_single_backtest(args_tuple) -> dict:
     """单次回测（用于并发执行）。"""
-    strategy_name, symbol, days, commission, stop_loss, take_profit, position_size, start_date, end_date, params = args_tuple
+    strategy_name, symbol, days, commission, stop_loss, take_profit, position_size, start_date, end_date, params, risk_params = args_tuple
     cls = STRATEGY_MAP.get(strategy_name.lower(), SMAStrategy)
     strategy = cls(**params)
+
+    risk_manager = None
+    if risk_params and risk_params.get("enabled"):
+        from risk.manager import RiskManager
+        risk_manager = RiskManager(
+            max_position_pct=risk_params.get("max_position_pct", 0.25),
+            max_positions=risk_params.get("max_positions", 10),
+            max_drawdown_pct=risk_params.get("max_drawdown_pct", 0.20),
+            max_daily_loss_pct=risk_params.get("max_daily_loss_pct", 0.03),
+            max_stock_loss_pct=risk_params.get("max_stock_loss_pct", 0.10),
+            enabled=True,
+        )
 
     engine = BacktestEngine(
         initial_cash=1_000_000,
@@ -58,6 +70,7 @@ def _run_single_backtest(args_tuple) -> dict:
         stop_loss=stop_loss,
         take_profit=take_profit,
         position_size=position_size,
+        risk_manager=risk_manager,
     )
     summary = engine.run(
         strategy,
@@ -100,6 +113,8 @@ class StrategyOptimizer:
         end_date: str | None = None,
         metric: str = "sharpe_ratio",
         workers: int = 4,
+        risk_params: dict | None = None,
+        walk_forward: bool = False,
     ):
         self.strategy_name = strategy_name
         self.symbol = symbol
@@ -112,6 +127,8 @@ class StrategyOptimizer:
         self.end_date = end_date
         self.metric = metric
         self.workers = workers
+        self.risk_params = risk_params
+        self.walk_forward = walk_forward
 
     def optimize(self, param_grid: dict[str, list]) -> dict[str, Any]:
         """运行 Grid Search。
@@ -122,15 +139,17 @@ class StrategyOptimizer:
         Returns:
             包含 best_params, best_score, all_results 的字典
         """
-        # 生成所有参数组合
         keys = list(param_grid.keys())
         values = list(param_grid.values())
         combinations = list(product(*values))
         total = len(combinations)
         print(f"参数优化: {total} 种组合 × {self.strategy_name} × {self.symbol}")
         print(f"优化指标: {OPTIMIZE_METRICS.get(self.metric, self.metric)}")
+        if self.risk_params and self.risk_params.get("enabled"):
+            print(f"风控: 已启用")
+        if self.walk_forward:
+            print(f"Walk-Forward: 已启用（将在验证期评估稳健性）")
 
-        # 准备并发任务
         args_list = [
             (
                 self.strategy_name,
@@ -143,6 +162,7 @@ class StrategyOptimizer:
                 self.start_date,
                 self.end_date,
                 dict(zip(keys, combo)),
+                self.risk_params,
             )
             for combo in combinations
         ]
