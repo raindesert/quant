@@ -169,6 +169,17 @@ class DataFetcher:
 
                 data = rs.data
                 if not data or len(data) == 0:
+                    # 尝试另一个交易所（用户可能提供了错误的后缀）
+                    parts = symbol.split(".")
+                    if len(parts) == 2:
+                        code_part, exchange = parts
+                        alt_exchange = "SH" if exchange.upper() == "SZ" else "SZ"
+                        alt_code = f"{code_part}.{alt_exchange.lower()}"
+                        if alt_code != code:
+                            bs.logout()
+                            return self._fetch_from_baostock(
+                                f"{code_part}.{alt_exchange}", days
+                            )
                     return pd.DataFrame()
 
                 df = pd.DataFrame(
