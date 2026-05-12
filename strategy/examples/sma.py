@@ -1,4 +1,8 @@
 """双均线策略示例"""
+from __future__ import annotations
+
+from typing import Any
+
 from strategy.base import BaseStrategy, Signal
 
 
@@ -8,11 +12,19 @@ class SMAStrategy(BaseStrategy):
     MAX_PRICES = 0
 
     def __init__(self, fast: int = 5, slow: int = 20):
-        super().__init__("SMA")
+        super().__init__("SMA", fast=fast, slow=slow)
         self.fast = fast
         self.slow = slow
         self.MAX_PRICES = slow + 2
-        self.prices = []
+        self.prices: list[float] = []
+
+    @classmethod
+    def get_params(cls) -> dict[str, Any]:
+        return {"fast": 5, "slow": 20}
+
+    @classmethod
+    def get_param_grid(cls) -> dict[str, list]:
+        return {"fast": [5, 10, 15, 20], "slow": [30, 60, 120]}
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])

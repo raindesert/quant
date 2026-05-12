@@ -23,23 +23,16 @@ from broker.simulator import SimulatorBroker
 from data.fetcher import DataFetcher
 from monitor.realtime import RealtimeMonitor
 from risk.manager import RiskManager
-from strategy.examples import (
-    BollingerStrategy,
-    MACDStrategy,
-    MeanReversionStrategy,
-    MomentumStrategy,
-    RSIStrategy,
-    SMAStrategy,
-)
+from strategy.registry import STRATEGY_REGISTRY, create_strategy, get_strategy_class, list_strategies
 from utils.logger import setup_logger
 
 
 def _run_single_backtest(args_tuple):
     """独立函数，用于并发回测（必须是模块级以支持 pickle）。"""
     strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params = args_tuple
-    strategy_cls = STRATEGIES.get(strategy_name.lower())
+    strategy_cls = get_strategy_class(strategy_name)
     if strategy_cls is None:
-        strategy_cls = SMAStrategy
+        strategy_cls = get_strategy_class("sma")
     strategy = strategy_cls()
 
     risk_manager = None
@@ -82,22 +75,13 @@ def _run_single_backtest(args_tuple):
 BASE_DIR = Path(__file__).parent
 DEFAULT_STRATEGY = "sma"
 
-STRATEGIES = {
-    "sma": SMAStrategy,
-    "rsi": RSIStrategy,
-    "macd": MACDStrategy,
-    "bollinger": BollingerStrategy,
-    "momentum": MomentumStrategy,
-    "mean_reversion": MeanReversionStrategy,
-}
-
 
 def get_strategy(strategy_name: str, symbol: str = "", load_params: bool = False):
     """根据名称创建策略实例，支持加载已保存的参数。"""
-    strategy_cls = STRATEGIES.get(strategy_name.lower())
+    strategy_cls = get_strategy_class(strategy_name)
     if strategy_cls is None:
         print(f"未知策略: {strategy_name}，将使用默认策略 SMA")
-        return SMAStrategy()
+        strategy_cls = get_strategy_class("sma")
 
     if load_params and symbol:
         from strategy.params import load_params as _load_params
@@ -398,7 +382,7 @@ def run_backtest(args, config, logger):
                      risk_manager.max_stock_loss_pct * 100)
 
     if args.all_strategies:
-        strategy_names = list(STRATEGIES.keys())
+        strategy_names = list_strategies()
         all_results = []
 
         tasks = []

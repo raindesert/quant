@@ -26,6 +26,7 @@ class DataFetcher:
 
     _history_cache: dict[str, tuple[pd.DataFrame, float]] = {}
     _CACHE_TTL = 3600
+    _MAX_CACHE_ENTRIES = 50
 
     def __init__(self, use_local_cache: bool = True):
         self.session = requests.Session()
@@ -36,6 +37,16 @@ class DataFetcher:
             }
         )
         self._local_cache = DataCache() if use_local_cache else None
+
+    @classmethod
+    def _trim_cache(cls):
+        if len(cls._history_cache) > cls._MAX_CACHE_ENTRIES:
+            sorted_keys = sorted(
+                cls._history_cache.keys(),
+                key=lambda k: cls._history_cache[k][1],
+            )
+            for key in sorted_keys[: len(sorted_keys) - cls._MAX_CACHE_ENTRIES]:
+                del cls._history_cache[key]
 
     @staticmethod
     def _to_tencent_symbol(symbol: str) -> str:
@@ -72,6 +83,7 @@ class DataFetcher:
             if not df.empty and len(df) >= days * 0.6:
                 self._local_cache.save(symbol, df)
                 self._history_cache[cache_key] = (df.copy(), now)
+                self._trim_cache()
                 return df
 
         if BAOSTOCK_AVAILABLE:
@@ -81,6 +93,7 @@ class DataFetcher:
                     if self._local_cache is not None:
                         self._local_cache.save(symbol, df)
                     self._history_cache[cache_key] = (df.copy(), now)
+                    self._trim_cache()
                     return df
             except Exception as exc:
                 logger.warning("baostock获取失败: %s", exc)
@@ -92,6 +105,7 @@ class DataFetcher:
                 if self._local_cache is not None:
                     self._local_cache.save(symbol, df)
                 self._history_cache[cache_key] = (df.copy(), now)
+                self._trim_cache()
                 return df
         except Exception as exc:
             logger.warning("腾讯API获取失败: %s", exc)
@@ -103,6 +117,7 @@ class DataFetcher:
                 cutoff = df["date"].max() - pd.Timedelta(days=days)
                 df = df[df["date"] >= cutoff].reset_index(drop=True)
                 self._history_cache[cache_key] = (df.copy(), now)
+                self._trim_cache()
                 return df
 
         raise RuntimeError(f"无法获取 {symbol} 历史数据，所有数据源均失败")
@@ -208,37 +223,47 @@ class DataFetcher:
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         params = {"param": f"{symbol},day,{start_date},{end_date},{days},qfq"}
 
-        response = self.session.get(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-            params=params,
-            timeout=10,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        max_retries = 3
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(
+                    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                    params=params,
+                    timeout=10,
+                )
+                response.raise_for_status()
+                payload = response.json()
 
-        data_map = payload.get("data") or {}
-        if not data_map:
-            return pd.DataFrame()
+                data_map = payload.get("data") or {}
+                if not data_map:
+                    return pd.DataFrame()
 
-        code = next(iter(data_map))
-        code_payload = data_map.get(code) or {}
-        day_data = code_payload.get("qfqday") or code_payload.get("day") or []
-        if not day_data:
-            return pd.DataFrame()
+                code = next(iter(data_map))
+                code_payload = data_map.get(code) or {}
+                day_data = code_payload.get("qfqday") or code_payload.get("day") or []
+                if not day_data:
+                    return pd.DataFrame()
 
-        normalized_rows = [row[:6] for row in day_data if len(row) >= 6]
-        df = pd.DataFrame(
-            normalized_rows,
-            columns=["date", "open", "close", "high", "low", "volume"],
-        )
-        df["date"] = pd.to_datetime(df["date"])
+                normalized_rows = [row[:6] for row in day_data if len(row) >= 6]
+                df = pd.DataFrame(
+                    normalized_rows,
+                    columns=["date", "open", "close", "high", "low", "volume"],
+                )
+                df["date"] = pd.to_datetime(df["date"])
 
-        for column in ["open", "close", "high", "low", "volume"]:
-            df[column] = pd.to_numeric(df[column], errors="coerce")
+                for column in ["open", "close", "high", "low", "volume"]:
+                    df[column] = pd.to_numeric(df[column], errors="coerce")
 
-        df["amount"] = df["volume"] * df["close"]
-        df["turnover"] = 0.0
-        return df.dropna().sort_values("date").reset_index(drop=True)
+                df["amount"] = df["volume"] * df["close"]
+                df["turnover"] = 0.0
+                return df.dropna().sort_values("date").reset_index(drop=True)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+        raise last_exc
 
     def get_realtime(self, symbol: str) -> Optional[dict]:
         tx_symbol = self._to_tencent_symbol(symbol)

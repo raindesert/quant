@@ -10,25 +10,9 @@ import pandas as pd
 from backtest.engine import BacktestEngine
 from data.fetcher import DataFetcher
 from data.processor import DataProcessor
-from strategy.examples import (
-    BollingerStrategy,
-    MACDStrategy,
-    MeanReversionStrategy,
-    MomentumStrategy,
-    RSIStrategy,
-    SMAStrategy,
-)
+from strategy.registry import get_strategy_class
 
 logger = logging.getLogger("quant")
-
-STRATEGY_MAP = {
-    "sma": SMAStrategy,
-    "rsi": RSIStrategy,
-    "macd": MACDStrategy,
-    "bollinger": BollingerStrategy,
-    "momentum": MomentumStrategy,
-    "mean_reversion": MeanReversionStrategy,
-}
 
 
 @dataclass
@@ -187,7 +171,9 @@ class WalkForwardValidator:
         return self._aggregate(windows)
 
     def _run_period(self, df: pd.DataFrame, start_date: str, end_date: str) -> dict | None:
-        cls = STRATEGY_MAP.get(self.strategy_name.lower(), SMAStrategy)
+        cls = get_strategy_class(self.strategy_name)
+        if cls is None:
+            cls = get_strategy_class("sma")
         strategy = cls(**self.strategy_params)
 
         engine = BacktestEngine(

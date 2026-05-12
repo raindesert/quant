@@ -66,6 +66,7 @@ class BacktestEngine(BaseBacktestEngine):
             return None
 
         df = processor.clean(df)
+        df = DataProcessor.add_all_indicators(df)
 
         if start_date:
             start_dt = pd.to_datetime(start_date)
@@ -79,6 +80,8 @@ class BacktestEngine(BaseBacktestEngine):
             return None
 
         print(f"回测开始: {symbol}, 数据量: {len(df)}")
+
+        strategy.on_init({"symbol": symbol, "days": days})
 
         bars = list(df.itertuples(index=False))
         if not bars:
@@ -217,6 +220,7 @@ class BacktestEngine(BaseBacktestEngine):
             }
             self.trades.append(trade)
             self._last_action = "buy"
+            strategy.on_order(trade)
             if self.verbose:
                 self._print_trade(trade)
             return
@@ -264,6 +268,7 @@ class BacktestEngine(BaseBacktestEngine):
             }
             self.trades.append(trade)
             self._last_action = "sell"
+            strategy.on_order(trade)
             if self.verbose:
                 self._print_trade(trade)
 

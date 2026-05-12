@@ -1,4 +1,8 @@
 """布林带策略 - 价格触及下轨买入，上轨卖出"""
+from __future__ import annotations
+
+from typing import Any
+
 from strategy.base import BaseStrategy, Signal
 
 
@@ -6,10 +10,18 @@ class BollingerStrategy(BaseStrategy):
     """布林带策略 - 突破下轨买入，突破上轨卖出"""
 
     def __init__(self, period: int = 20, std_dev: float = 2.0):
-        super().__init__("Bollinger")
+        super().__init__("Bollinger", period=period, std_dev=std_dev)
         self.period = period
         self.std_dev = std_dev
-        self.prices = []
+        self.prices: list[float] = []
+
+    @classmethod
+    def get_params(cls) -> dict[str, Any]:
+        return {"period": 20, "std_dev": 2.0}
+
+    @classmethod
+    def get_param_grid(cls) -> dict[str, list]:
+        return {"period": [10, 20, 30], "std_dev": [1.5, 2.0, 2.5]}
 
     def on_bar(self, bar: dict) -> str:
         self.prices.append(bar["close"])

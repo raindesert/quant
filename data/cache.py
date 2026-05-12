@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
 logger = logging.getLogger("quant")
+
+_SAFE_TABLE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 class DataCache:
@@ -49,7 +52,17 @@ class DataCache:
         return self._conn
 
     def _table_name(self, symbol: str) -> str:
-        return symbol.replace(".", "_").replace("-", "_")
+        name = symbol.replace(".", "_").replace("-", "_")
+        if not _SAFE_TABLE_RE.match(name):
+            raise ValueError(f"非法表名: {name}")
+        return name
+
+    def _table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        return cursor.fetchone() is not None
 
     def save(self, symbol: str, df: pd.DataFrame):
         conn = self._get_conn()
@@ -79,22 +92,26 @@ class DataCache:
             return pd.DataFrame()
         table = self._table_name(symbol)
 
-        try:
-            cursor = conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")
-            if cursor.fetchone() is None:
-                return pd.DataFrame()
-        except Exception:
+        if not self._table_exists(conn, table):
             return pd.DataFrame()
 
-        query = f"SELECT * FROM {table} WHERE 1=1"
+        conditions = []
+        params: list[str] = []
         if start_date:
-            query += f" AND date >= '{start_date}'"
+            conditions.append("date >= ?")
+            params.append(start_date)
         if end_date:
-            query += f" AND date <= '{end_date}'"
-        query += " ORDER BY date"
+            conditions.append("date <= ?")
+            params.append(end_date)
+
+        where = ""
+        if conditions:
+            where = " WHERE " + " AND ".join(conditions)
+
+        query = f"SELECT * FROM {table}{where} ORDER BY date"
 
         try:
-            df = pd.read_sql_query(query, conn)
+            df = pd.read_sql_query(query, conn, params=params)
         except Exception:
             return pd.DataFrame()
 
@@ -113,8 +130,7 @@ class DataCache:
             return None
         table = self._table_name(symbol)
         try:
-            cursor = conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")
-            if cursor.fetchone() is None:
+            if not self._table_exists(conn, table):
                 return None
             cursor = conn.execute(f"SELECT MAX(date) FROM {table}")
             row = cursor.fetchone()
@@ -124,8 +140,7 @@ class DataCache:
 
     def _get_existing_dates(self, conn: sqlite3.Connection, table: str) -> set[str]:
         try:
-            cursor = conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")
-            if cursor.fetchone() is None:
+            if not self._table_exists(conn, table):
                 return set()
             cursor = conn.execute(f"SELECT date FROM {table}")
             return {row[0] for row in cursor.fetchall()}

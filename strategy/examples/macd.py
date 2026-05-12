@@ -1,4 +1,8 @@
 """MACD 策略。"""
+from __future__ import annotations
+
+from typing import Any
+
 from strategy.base import BaseStrategy, Signal
 
 
@@ -6,7 +10,7 @@ class MACDStrategy(BaseStrategy):
     """MACD 金叉买入，死叉卖出。"""
 
     def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9):
-        super().__init__("MACD")
+        super().__init__("MACD", fast=fast, slow=slow, signal=signal)
         self.fast = fast
         self.slow = slow
         self.signal = signal
@@ -15,6 +19,14 @@ class MACDStrategy(BaseStrategy):
         self.signal_ema = None
         self.prev_macd = None
         self._bar_count = 0
+
+    @classmethod
+    def get_params(cls) -> dict[str, Any]:
+        return {"fast": 12, "slow": 26, "signal": 9}
+
+    @classmethod
+    def get_param_grid(cls) -> dict[str, list]:
+        return {"fast": [8, 12, 16], "slow": [20, 26, 34], "signal": [7, 9, 13]}
 
     @staticmethod
     def _next_ema(previous: float | None, price: float, period: int) -> float:

@@ -1,4 +1,8 @@
 """RSI 策略 - 相对强弱指标 (Wilder's smoothing)"""
+from __future__ import annotations
+
+from typing import Any
+
 from strategy.base import BaseStrategy, Signal
 
 
@@ -6,7 +10,7 @@ class RSIStrategy(BaseStrategy):
     """RSI 超卖买入，超买卖出"""
 
     def __init__(self, period: int = 14, oversold: float = 30, overbought: float = 70):
-        super().__init__("RSI")
+        super().__init__("RSI", period=period, oversold=oversold, overbought=overbought)
         self.period = period
         self.oversold = oversold
         self.overbought = overbought
@@ -14,7 +18,15 @@ class RSIStrategy(BaseStrategy):
         self.avg_loss = 0.0
         self.initialized = False
         self._prev_price = None
-        self._warmup_prices = []
+        self._warmup_prices: list[float] = []
+
+    @classmethod
+    def get_params(cls) -> dict[str, Any]:
+        return {"period": 14, "oversold": 30, "overbought": 70}
+
+    @classmethod
+    def get_param_grid(cls) -> dict[str, list]:
+        return {"period": [7, 14, 21], "oversold": [20, 30], "overbought": [70, 80]}
 
     def on_bar(self, bar: dict) -> str:
         price = bar["close"]

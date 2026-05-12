@@ -67,7 +67,7 @@ class BaseBacktestEngine:
 
     @staticmethod
     def _row_to_bar(row, symbol: str) -> dict:
-        return {
+        bar = {
             "symbol": symbol,
             "date": row.date,
             "timestamp": row.date,
@@ -78,6 +78,19 @@ class BaseBacktestEngine:
             "last_price": row.close,
             "volume": row.volume,
         }
+        indicator_fields = [
+            "ma5", "ma10", "ma20", "ma60",
+            "bb_mid", "bb_upper", "bb_lower", "bb_std",
+            "rsi",
+            "macd_dif", "macd_dea", "macd_hist",
+            "atr",
+            "k", "d", "j",
+        ]
+        for field in indicator_fields:
+            val = getattr(row, field, None)
+            if val is not None and not (isinstance(val, float) and (val != val)):
+                bar[field] = val
+        return bar
 
     def _apply_slippage(self, price: float, direction: str) -> float:
         if self.slippage <= 0:

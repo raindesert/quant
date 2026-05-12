@@ -6,26 +6,9 @@ from itertools import product
 from typing import Any, Callable
 
 from backtest.engine import BacktestEngine
-from strategy.examples import (
-    BollingerStrategy,
-    MACDStrategy,
-    MeanReversionStrategy,
-    MomentumStrategy,
-    RSIStrategy,
-    SMAStrategy,
-)
+from strategy.registry import STRATEGY_REGISTRY, get_strategy_class
 
 
-STRATEGY_MAP = {
-    "sma": SMAStrategy,
-    "rsi": RSIStrategy,
-    "macd": MACDStrategy,
-    "bollinger": BollingerStrategy,
-    "momentum": MomentumStrategy,
-    "mean_reversion": MeanReversionStrategy,
-}
-
-# 各策略的默认参数范围（用于 --auto-tune）
 DEFAULT_GRIDS = {
     "sma": {"fast": [5, 10, 15, 20], "slow": [30, 60, 120]},
     "rsi": {"period": [7, 14, 21], "oversold": [20, 30], "overbought": [70, 80]},
@@ -48,7 +31,9 @@ OPTIMIZE_METRICS = {
 def _run_single_backtest(args_tuple) -> dict:
     """单次回测（用于并发执行）。"""
     strategy_name, symbol, days, commission, stop_loss, take_profit, position_size, start_date, end_date, params, risk_params = args_tuple
-    cls = STRATEGY_MAP.get(strategy_name.lower(), SMAStrategy)
+    cls = get_strategy_class(strategy_name)
+    if cls is None:
+        cls = get_strategy_class("sma")
     strategy = cls(**params)
 
     risk_manager = None
