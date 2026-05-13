@@ -282,17 +282,24 @@ class DataFetcher:
                 return None
 
             last_price = float(fields[3])
+            prev_close = float(fields[4])
+            change = last_price - prev_close
+            change_pct = (change / prev_close * 100) if prev_close > 0 else 0.0
             current_time = datetime.now()
             return {
                 "symbol": symbol,
                 "name": fields[1],
+                "price": last_price,
+                "last_price": last_price,
                 "open": float(fields[5]),
                 "high": float(fields[33]),
                 "low": float(fields[34]),
                 "close": last_price,
-                "last_price": last_price,
-                "prev_close": float(fields[4]),
+                "prev_close": prev_close,
+                "change": change,
+                "change_pct": change_pct,
                 "volume": float(fields[6]),
+                "amount": float(fields[38]) if len(fields) > 38 else 0.0,
                 "date": current_time,
                 "timestamp": current_time,
             }
