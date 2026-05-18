@@ -5,7 +5,34 @@
       "Bash(git init *)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(python3 main.py --mode backtest --symbol 000001.SZ --strategy sma --days 120 --verbose)"
+      "Bash(python3 main.py --mode backtest --symbol 000001.SZ --strategy sma --days 120 --verbose)",
+      "Bash(python3 main.py --mode backtest --symbol 000001.SZ --days 30 --strategy sma)",
+      "Bash(pip3 install *)",
+      "Read(//usr/bin/**)",
+      "Bash(command -v conda)",
+      "Bash(python3 -m pip install pandas numpy pyyaml requests)",
+      "Bash(python3 -m ensurepip)",
+      "Bash(python3 -m pip install pandas numpy pyyaml requests akshare)",
+      "Bash(apt-get install *)",
+      "Bash(curl -s https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py)",
+      "Bash(python3 /tmp/get-pip.py)",
+      "Bash(python3 /tmp/get-pip.py --break-system-packages)",
+      "Bash(~/.local/bin/pip3 install *)",
+      "Bash(python3 main.py --mode backtest --symbol 000001.SZ --strategy sma)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 main.py --mode backtest --symbol 000001.SZ --days 30 --strategy sma --verbose)",
+      "Bash(python3 main.py --mode backtest --symbol 000001.SZ --all-strategies)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git remote *)",
+      "Bash(command -v gh)",
+      "Bash(gh auth *)",
+      "Bash(ssh -T git@github.com)",
+      "Bash(ssh-keyscan -t rsa,ed25519 github.com)",
+      "Bash(GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no\" git push)"
+    ],
+    "additionalDirectories": [
+      "/home/raindesert/.ssh"
     ]
   }
 }

@@ -17,6 +17,7 @@ class MACDStrategy(BaseStrategy):
         self.fast_ema = None
         self.slow_ema = None
         self.signal_ema = None
+        self.prev_signal_ema = None
         self.prev_macd = None
         self._bar_count = 0
 
@@ -46,7 +47,8 @@ class MACDStrategy(BaseStrategy):
         self.fast_ema = self._next_ema(self.fast_ema, price, self.fast)
         self.slow_ema = self._next_ema(self.slow_ema, price, self.slow)
         macd = self.fast_ema - self.slow_ema
-        previous_signal = self.signal_ema if self.signal_ema is not None else macd
+        previous_signal = self.prev_signal_ema if self.prev_signal_ema is not None else macd
+        self.prev_signal_ema = self.signal_ema
         self.signal_ema = self._next_ema(self.signal_ema, macd, self.signal)
 
         if self.prev_macd is None:

@@ -1,4 +1,4 @@
-market: cn
+# market: cn  # TODO: 未使用，待移除或实现
 default_symbol: "000001.SZ"
 initial_cash: 1000000
 
