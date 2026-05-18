@@ -30,6 +30,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
         stop_loss: float = 0.0,
         take_profit: float = 0.0,
         max_positions: int = 5,
+        position_size: float = 1.0,
         slippage: float = 0.0,
         slippage_type: str = "percent",
         enforce_t_plus_1: bool = True,
@@ -49,6 +50,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
             risk_manager=risk_manager,
         )
         self.max_positions = max_positions
+        self.position_size = position_size
 
     def reset(self):
         super().reset()
@@ -109,7 +111,7 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
 
         benchmark_shares = {sym: 0 for sym in symbol_data}
         benchmark_cash = self.initial_cash
-        per_stock_budget = self.initial_cash * 0.5 / len(symbol_data)
+        per_stock_budget = self.initial_cash * self.position_size / len(symbol_data)
 
         trading_dates = common_dates[warmup_count:]
         for di, date in enumerate(trading_dates[:-1]):
@@ -165,6 +167,14 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 "action": action_str,
             })
             self._last_actions = actions
+
+            if self.risk_manager is not None:
+                self.risk_manager.update_portfolio_state(
+                    total_value=combined_val,
+                    positions=self.positions,
+                    last_prices=self.last_prices,
+                    date=date,
+                )
 
         last_date = trading_dates[-1]
         last_bars = {}
@@ -222,11 +232,12 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 return
 
             if symbol in self.positions:
-                budget = self.cash * 0.5
+                budget = self.cash * self.position_size
             else:
-                budget = self.cash * 0.5 / (current_holdings + 1) if current_holdings < self.max_positions else 0
+                budget = self.cash * self.position_size / (current_holdings + 1) if current_holdings < self.max_positions else 0
             affordable = int(budget / (actual_price * (1 + self.commission)) / lot_size) * lot_size
             if affordable <= 0:
+                logger.warning("预算不足，无法买入 %s: budget=%.2f, price=%.2f", symbol, budget, actual_price)
                 return
 
             if self.risk_manager is not None:

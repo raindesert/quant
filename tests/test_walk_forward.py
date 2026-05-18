@@ -120,9 +120,10 @@ class TestWalkForwardValidator:
         assert v.test_days == 30
         assert v.overfit_threshold == 0.3
 
+    @patch("backtest.walk_forward.DataProcessor.add_all_indicators")
     @patch("backtest.walk_forward.DataFetcher")
     @patch("backtest.walk_forward.DataProcessor")
-    def test_validate_with_mock_data(self, mock_processor_cls, mock_fetcher_cls):
+    def test_validate_with_mock_data(self, mock_processor_cls, mock_fetcher_cls, mock_add_all):
         test_df = _make_test_df(300)
 
         mock_fetcher = MagicMock()
@@ -132,6 +133,8 @@ class TestWalkForwardValidator:
         mock_processor = MagicMock()
         mock_processor.clean.return_value = test_df
         mock_processor_cls.return_value = mock_processor
+
+        mock_add_all.return_value = test_df
 
         validator = WalkForwardValidator(
             strategy_name="sma",

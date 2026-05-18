@@ -10,6 +10,7 @@ import pandas as pd
 from backtest.engine import BacktestEngine
 from data.fetcher import DataFetcher
 from data.processor import DataProcessor
+from strategy.base import Signal
 from strategy.registry import get_strategy_class
 
 logger = logging.getLogger("quant")
@@ -124,6 +125,7 @@ class WalkForwardValidator:
             return WalkForwardResult(self.strategy_name, self.symbol)
 
         df = processor.clean(df)
+        df = DataProcessor.add_all_indicators(df)
         if len(df) < self.train_days + self.test_days:
             logger.error("数据不足: 需要 %d 天，实际 %d 天", self.train_days + self.test_days, len(df))
             return WalkForwardResult(self.strategy_name, self.symbol)
@@ -197,63 +199,7 @@ class WalkForwardValidator:
         if len(period_df) < 30:
             return None
 
-        bars = list(period_df.itertuples(index=False))
-        symbol = self.symbol
-        warmup_count = min(20, len(bars) - 1)
-
-        first_bar = engine._row_to_bar(bars[0], symbol)
-        engine.last_prices[symbol] = first_bar["close"]
-        benchmark_shares = 0
-        benchmark_cash = engine.initial_cash
-
-        for i, row in enumerate(bars[:warmup_count]):
-            bar = engine._row_to_bar(row, symbol)
-            engine.last_prices[symbol] = bar["close"]
-            engine.last_bars[symbol] = bar
-            strategy.on_bar(bar)
-
-        for i in range(warmup_count, len(bars) - 1):
-            current_bar = engine._row_to_bar(bars[i], symbol)
-            next_bar = engine._row_to_bar(bars[i + 1], symbol)
-            engine.last_prices[symbol] = current_bar["close"]
-            engine.last_bars[symbol] = current_bar
-
-            if benchmark_shares == 0:
-                open_price = current_bar["open"]
-                cost_per_100 = engine._calc_buy_cost(open_price, 100)
-                affordable = int(engine.initial_cash * 0.5 / cost_per_100) * 100
-                if affordable > 0:
-                    cost = engine._calc_buy_cost(open_price, affordable)
-                    benchmark_cash -= cost
-                    benchmark_shares = affordable
-            benchmark_value = benchmark_cash + benchmark_shares * current_bar["close"]
-            engine.benchmark_curve.append({"date": current_bar["date"], "value": benchmark_value})
-
-            engine._check_stop_loss(symbol, next_bar["open"], engine.pending_signal)
-            engine._check_take_profit(symbol, next_bar["open"], engine.pending_signal)
-
-            if symbol in engine.pending_signal:
-                signal = engine.pending_signal.pop(symbol)
-                engine._execute_signal(signal, next_bar, strategy)
-
-            signal = strategy.on_bar(current_bar)
-            if signal != "hold":
-                engine.pending_signal[symbol] = signal
-
-            engine.equity_curve.append({"date": current_bar["date"], "value": engine.get_total_value(), "action": engine._last_action})
-            engine._last_action = None
-
-        last_bar = engine._row_to_bar(bars[-1], symbol)
-        engine.last_prices[symbol] = last_bar["close"]
-        if symbol in engine.pending_signal:
-            engine._check_stop_loss(symbol, last_bar["open"], engine.pending_signal)
-            engine._check_take_profit(symbol, last_bar["open"], engine.pending_signal)
-            signal = engine.pending_signal.pop(symbol)
-            engine._execute_signal(signal, last_bar, strategy)
-        strategy.on_bar(last_bar)
-        engine.equity_curve.append({"date": last_bar["date"], "value": engine.get_total_value()})
-
-        return engine.get_summary(symbol)
+        return engine._run_with_data(strategy, period_df, self.symbol)
 
     def _aggregate(self, windows: list[WalkForwardWindow]) -> WalkForwardResult:
         result = WalkForwardResult(

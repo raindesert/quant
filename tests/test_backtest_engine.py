@@ -105,19 +105,19 @@ class TestLimitUpLimitDown:
     def test_main_board_limit_up(self):
         eng = EngineForTest(check_limit=True)
         eng.last_bars["000001.SZ"] = {"close": 10.0}
-        bar = {"close": 11.0}
+        bar = {"open": 11.0}
         assert eng._is_limit_up("000001.SZ", bar) is True
 
     def test_main_board_not_limit_up(self):
         eng = EngineForTest(check_limit=True)
         eng.last_bars["000001.SZ"] = {"close": 10.0}
-        bar = {"close": 10.5}
+        bar = {"open": 10.5}
         assert eng._is_limit_up("000001.SZ", bar) is False
 
     def test_main_board_limit_down(self):
         eng = EngineForTest(check_limit=True)
         eng.last_bars["000001.SZ"] = {"close": 10.0}
-        bar = {"close": 9.0}
+        bar = {"open": 9.0}
         assert eng._is_limit_down("000001.SZ", bar) is True
 
     def test_kcb_limit_threshold(self):

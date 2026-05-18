@@ -119,13 +119,13 @@ class TestPartialSellReducesPosition(unittest.TestCase):
 
 class TestBenchmarkInitialization(unittest.TestCase):
     def test_benchmark_starts_with_correct_allocation(self):
-        """Benchmark initializes with 50% allocation to each stock."""
+        """Benchmark initializes with default position_size."""
         engine = make_engine()
         engine.reset()
 
         self.assertEqual(engine.cash, 1_000_000)
         self.assertEqual(engine.max_positions, 5)
-        self.assertEqual(engine.DEFAULT_BENCHMARK_ALLOCATION, 0.5)
+        self.assertEqual(engine.position_size, 1.0)
 
 
 class TestSellWithoutPositionIgnored(unittest.TestCase):

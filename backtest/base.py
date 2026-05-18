@@ -107,7 +107,7 @@ class BaseBacktestEngine:
         if prev_close is None or prev_close <= 0:
             return False
         threshold = self._get_limit_threshold(symbol)
-        return bar["close"] >= prev_close * (1 + threshold - 0.001)
+        return bar["open"] >= prev_close * (1 + threshold - 0.001)
 
     def _is_limit_down(self, symbol: str, bar: dict) -> bool:
         if not self.check_limit:
@@ -116,7 +116,7 @@ class BaseBacktestEngine:
         if prev_close is None or prev_close <= 0:
             return False
         threshold = self._get_limit_threshold(symbol)
-        return bar["close"] <= prev_close * (1 - threshold + 0.001)
+        return bar["open"] <= prev_close * (1 - threshold + 0.001)
 
     def _get_prev_close(self, symbol: str) -> float | None:
         last_bar = self.last_bars.get(symbol)
@@ -321,8 +321,8 @@ class BaseBacktestEngine:
             return 0.0
         excess_returns = [r - self.RISK_FREE_RATE_DAILY for r in returns]
         mean_excess = sum(excess_returns) / len(excess_returns)
-        downside_returns = [r for r in returns if r < 0]
-        downside_std = math.sqrt(sum(r ** 2 for r in downside_returns) / len(returns)) if downside_returns else 0.0
+        downside_excess = [r for r in excess_returns if r < 0]
+        downside_std = math.sqrt(sum(r ** 2 for r in downside_excess) / len(excess_returns)) if downside_excess else 0.0
         if downside_std < 1e-10:
             return 0.0
         return (mean_excess / downside_std) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
@@ -394,7 +394,7 @@ class BaseBacktestEngine:
         win_rate = win_trades / total * 100 if total else 0.0
         avg_win = total_profit / win_trades if win_trades else 0.0
         avg_loss = total_loss / (total - win_trades) if total and total > win_trades else 0.0
-        profit_factor = total_profit / total_loss if total_loss > 0 else float("inf") if total_profit > 0 else 0.0
+        profit_factor = total_profit / total_loss if total_loss > 0 else (999.0 if total_profit > 0 else 0.0)
 
         holding_days = []
         buy_date_map = {}

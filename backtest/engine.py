@@ -55,8 +55,6 @@ class BacktestEngine(BaseBacktestEngine):
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict | None:
-        self.reset()
-
         fetcher = DataFetcher()
         processor = DataProcessor()
 
@@ -81,7 +79,12 @@ class BacktestEngine(BaseBacktestEngine):
 
         print(f"回测开始: {symbol}, 数据量: {len(df)}")
 
-        strategy.on_init({"symbol": symbol, "days": days})
+        return self._run_with_data(strategy, df, symbol)
+
+    def _run_with_data(self, strategy, df: pd.DataFrame, symbol: str) -> dict | None:
+        self.reset()
+
+        strategy.on_init({"symbol": symbol, "days": len(df)})
 
         bars = list(df.itertuples(index=False))
         if not bars:
@@ -129,8 +132,17 @@ class BacktestEngine(BaseBacktestEngine):
             if signal != Signal.HOLD:
                 self.pending_signal[symbol] = signal
 
-            self.equity_curve.append({"date": current_bar["date"], "value": self.get_total_value(), "action": self._last_action})
+            total_value = self.get_total_value()
+            self.equity_curve.append({"date": current_bar["date"], "value": total_value, "action": self._last_action})
             self._last_action = None
+
+            if self.risk_manager is not None:
+                self.risk_manager.update_portfolio_state(
+                    total_value=total_value,
+                    positions=self.positions,
+                    last_prices=self.last_prices,
+                    date=current_bar["date"],
+                )
 
         last_bar = self._row_to_bar(bars[-1], symbol)
         self.last_prices[symbol] = last_bar["close"]
@@ -145,7 +157,16 @@ class BacktestEngine(BaseBacktestEngine):
 
         strategy.on_bar(last_bar)
 
-        self.equity_curve.append({"date": last_bar["date"], "value": self.get_total_value(), "action": self._last_action})
+        total_value = self.get_total_value()
+        self.equity_curve.append({"date": last_bar["date"], "value": total_value, "action": self._last_action})
+
+        if self.risk_manager is not None:
+            self.risk_manager.update_portfolio_state(
+                total_value=total_value,
+                positions=self.positions,
+                last_prices=self.last_prices,
+                date=last_bar["date"],
+            )
 
         if self.verbose:
             self._print_trades()
