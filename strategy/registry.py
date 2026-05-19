@@ -8,6 +8,8 @@ from strategy.examples.bollinger import BollingerStrategy
 from strategy.examples.momentum import MomentumStrategy
 from strategy.examples.mean_reversion import MeanReversionStrategy
 
+from strategy.examples.kdj import KDJStrategy
+
 STRATEGY_REGISTRY: dict[str, type] = {
     "sma": SMAStrategy,
     "rsi": RSIStrategy,
@@ -15,6 +17,7 @@ STRATEGY_REGISTRY: dict[str, type] = {
     "bollinger": BollingerStrategy,
     "momentum": MomentumStrategy,
     "mean_reversion": MeanReversionStrategy,
+    "kdj": KDJStrategy,
 }
 
 

@@ -7,6 +7,7 @@ from strategy.examples.macd import MACDStrategy
 from strategy.examples.bollinger import BollingerStrategy
 from strategy.examples.momentum import MomentumStrategy
 from strategy.examples.mean_reversion import MeanReversionStrategy
+from strategy.examples.kdj import KDJStrategy
 from strategy.base import Signal
 
 
@@ -200,18 +201,61 @@ class TestMomentumBuy(unittest.TestCase):
         """Positive momentum (price rising) triggers BUY."""
         strat = MomentumStrategy(period=10, threshold=0.02)
 
-        # Build initial prices
         for _ in range(12):
             bar = make_bar(close=100.0)
             strat.on_bar(bar)
 
-        # Now price goes up significantly to generate positive momentum
         for p in [101, 102, 103, 104, 105]:
             sig = strat.on_bar(make_bar(close=p))
             if sig == Signal.BUY:
                 break
 
         self.assertEqual(sig, Signal.BUY)
+
+
+class TestKDJGoldenCrossBuy(unittest.TestCase):
+    def test_kdj_golden_cross_buy(self):
+        """KDJ K crosses above D in oversold zone triggers BUY."""
+        strat = KDJStrategy(n=9, m1=3, m2=3, oversold=20, overbought=80)
+
+        bars = [
+            make_bar(close=100, open_p=100, high=100, low=100),
+            make_bar(close=100, open_p=100, high=100, low=100),
+            make_bar(close=100, open_p=100, high=100, low=100),
+        ]
+        bars[0]["k"], bars[0]["d"], bars[0]["j"] = 18.0, 19.0, 16.0
+        bars[1]["k"], bars[1]["d"], bars[1]["j"] = 18.0, 18.0, 18.0
+        bars[2]["k"], bars[2]["d"], bars[2]["j"] = 19.0, 18.8, 19.4
+
+        for b in bars[:2]:
+            sig = strat.on_bar(b)
+            self.assertEqual(sig, Signal.HOLD)
+
+        sig = strat.on_bar(bars[2])
+        self.assertEqual(sig, Signal.BUY)
+
+
+class TestKDJDeathCrossSell(unittest.TestCase):
+    def test_kdj_death_cross_sell(self):
+        """KDJ K crosses below D in overbought zone triggers SELL."""
+        strat = KDJStrategy(n=9, m1=3, m2=3, oversold=20, overbought=80)
+
+        bars = [
+            make_bar(close=100, open_p=100, high=100, low=100),
+            make_bar(close=100, open_p=100, high=100, low=100),
+            make_bar(close=100, open_p=100, high=100, low=100),
+        ]
+        bars[0]["k"], bars[0]["d"], bars[0]["j"] = 82.0, 81.0, 84.0
+        bars[1]["k"], bars[1]["d"], bars[1]["j"] = 81.0, 81.0, 81.0
+        bars[2]["k"], bars[2]["d"], bars[2]["j"] = 80.0, 80.5, 79.0
+
+        for b in bars[:2]:
+            strat.on_bar(b)
+
+        strat.set_position("TEST", 1000)
+
+        sig = strat.on_bar(bars[2])
+        self.assertEqual(sig, Signal.SELL)
 
 
 if __name__ == "__main__":

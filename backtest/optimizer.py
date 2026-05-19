@@ -16,6 +16,7 @@ DEFAULT_GRIDS = {
     "bollinger": {"period": [10, 20, 30], "std_dev": [1.5, 2.0, 2.5]},
     "momentum": {"period": [5, 10, 20], "threshold": [0.01, 0.02, 0.05]},
     "mean_reversion": {"period": [10, 20, 30], "threshold": [0.01, 0.02, 0.05]},
+    "kdj": {"n": [9, 14, 21], "m1": [2, 3, 5], "m2": [2, 3, 5], "oversold": [15, 20, 25], "overbought": [75, 80, 85]},
 }
 
 # 可优化的指标

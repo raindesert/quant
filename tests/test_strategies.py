@@ -10,6 +10,7 @@ from strategy.examples.macd import MACDStrategy
 from strategy.examples.bollinger import BollingerStrategy
 from strategy.examples.momentum import MomentumStrategy
 from strategy.examples.mean_reversion import MeanReversionStrategy
+from strategy.examples.kdj import KDJStrategy
 
 
 def _make_bar(close: float, symbol: str = "000001.SZ", open_: float | None = None):
@@ -151,3 +152,18 @@ class TestMeanReversionStrategy:
         s.on_bar(_make_bar(10.0))
         s.reset()
         assert len(s.prices) == 0
+
+
+class TestKDJStrategy:
+    def test_hold_without_kdj_columns(self):
+        s = KDJStrategy()
+        result = s.on_bar({"symbol": "000001.SZ", "close": 10.0})
+        assert result == Signal.HOLD
+
+    def test_reset(self):
+        s = KDJStrategy()
+        bar = {"symbol": "000001.SZ", "close": 10.0, "k": 50.0, "d": 50.0, "j": 50.0}
+        s.on_bar(bar)
+        s.reset()
+        assert s._prev_k is None
+        assert s._prev_d is None

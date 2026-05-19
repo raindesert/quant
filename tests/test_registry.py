@@ -19,6 +19,7 @@ class TestStrategyRegistry:
         assert "bollinger" in STRATEGY_REGISTRY
         assert "momentum" in STRATEGY_REGISTRY
         assert "mean_reversion" in STRATEGY_REGISTRY
+        assert "kdj" in STRATEGY_REGISTRY
 
     def test_get_strategy_class(self):
         from strategy.examples.sma import SMAStrategy
@@ -49,7 +50,7 @@ class TestStrategyRegistry:
 
     def test_list_strategies(self):
         names = list_strategies()
-        assert len(names) >= 6
+        assert len(names) >= 7
         assert "sma" in names
         assert "rsi" in names
 
