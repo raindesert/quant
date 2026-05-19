@@ -1,6 +1,6 @@
 """Tests for RealtimeMonitor."""
 import unittest
-from threading import Thread, Lock
+from threading import Thread
 import time
 
 from monitor.realtime import RealtimeMonitor
@@ -25,7 +25,7 @@ class TestThreadSafetyNoRaceCondition(unittest.TestCase):
         def writer():
             try:
                 for i in range(1000):
-                    with monitor._lock:
+                    with monitor._prices_lock:
                         monitor.prices["TEST"] = {"last_price": float(i)}
             except Exception as e:
                 errors.append(e)
@@ -74,7 +74,7 @@ class TestCallbackExceptionDoesntCrashLoop(unittest.TestCase):
         for callback in callbacks:
             try:
                 callback("TEST", test_data["TEST"])
-            except Exception as exc:
+            except Exception:
                 # Exception should be caught per design
                 pass
 
