@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -25,6 +26,7 @@ class DataFetcher:
     """获取历史行情与实时行情，支持本地SQLite缓存。"""
 
     _history_cache: dict[str, tuple[pd.DataFrame, float]] = {}
+    _cache_lock = threading.Lock()  # 保护 _history_cache 的并发读写
     _CACHE_TTL = 3600
     _MAX_CACHE_ENTRIES = 50
 
@@ -40,6 +42,7 @@ class DataFetcher:
 
     @classmethod
     def _trim_cache(cls):
+        # 调用方必须已持有 _cache_lock
         if len(cls._history_cache) > cls._MAX_CACHE_ENTRIES:
             sorted_keys = sorted(
                 cls._history_cache.keys(),
@@ -72,7 +75,9 @@ class DataFetcher:
 
         cache_key = f"{symbol}_{days}"
         now = time.time()
-        cached_entry = self._history_cache.get(cache_key)
+        # 读锁：检查缓存是否命中
+        with self._cache_lock:
+            cached_entry = self._history_cache.get(cache_key)
         if cached_entry is not None:
             cached_df, cached_time = cached_entry
             if now - cached_time < self._CACHE_TTL:
@@ -82,8 +87,9 @@ class DataFetcher:
             df = self._try_incremental_fetch(symbol, days)
             if not df.empty and len(df) >= days * 0.6:
                 self._local_cache.save(symbol, df)
-                self._history_cache[cache_key] = (df.copy(), now)
-                self._trim_cache()
+                with self._cache_lock:
+                    self._history_cache[cache_key] = (df.copy(), now)
+                    self._trim_cache()
                 return df
 
         if BAOSTOCK_AVAILABLE:
@@ -92,8 +98,9 @@ class DataFetcher:
                 if not df.empty and len(df) >= days * 0.6:
                     if self._local_cache is not None:
                         self._local_cache.save(symbol, df)
-                    self._history_cache[cache_key] = (df.copy(), now)
-                    self._trim_cache()
+                    with self._cache_lock:
+                        self._history_cache[cache_key] = (df.copy(), now)
+                        self._trim_cache()
                     return df
             except Exception as exc:
                 logger.warning("baostock获取失败: %s", exc)
@@ -104,8 +111,9 @@ class DataFetcher:
             if not df.empty and len(df) >= days * 0.7:
                 if self._local_cache is not None:
                     self._local_cache.save(symbol, df)
-                self._history_cache[cache_key] = (df.copy(), now)
-                self._trim_cache()
+                with self._cache_lock:
+                    self._history_cache[cache_key] = (df.copy(), now)
+                    self._trim_cache()
                 return df
         except Exception as exc:
             logger.warning("腾讯API获取失败: %s", exc)
@@ -116,8 +124,9 @@ class DataFetcher:
                 logger.info("使用本地缓存数据: %s (%d条)", symbol, len(df))
                 cutoff = df["date"].max() - pd.Timedelta(days=days)
                 df = df[df["date"] >= cutoff].reset_index(drop=True)
-                self._history_cache[cache_key] = (df.copy(), now)
-                self._trim_cache()
+                with self._cache_lock:
+                    self._history_cache[cache_key] = (df.copy(), now)
+                    self._trim_cache()
                 return df
 
         raise RuntimeError(f"无法获取 {symbol} 历史数据，所有数据源均失败")
@@ -162,8 +171,14 @@ class DataFetcher:
 
         return cached_df
 
-    def _fetch_from_baostock(self, symbol: str, days: int) -> pd.DataFrame:
+    # 备用交易所（用户可能提供错误后缀）最多尝试 1 次，避免无限递归
+    _BAOSTOCK_MAX_ALT_TRIES = 1
+
+    def _fetch_from_baostock(
+        self, symbol: str, days: int, _alt_tries: int = 0
+    ) -> pd.DataFrame:
         max_retries = 3
+        last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
                 bs.login()
@@ -185,15 +200,11 @@ class DataFetcher:
                 data = rs.data
                 if not data or len(data) == 0:
                     # 尝试另一个交易所（用户可能提供了错误的后缀）
-                    parts = symbol.split(".")
-                    if len(parts) == 2:
-                        code_part, exchange = parts
-                        alt_exchange = "SH" if exchange.upper() == "SZ" else "SZ"
-                        alt_code = f"{code_part}.{alt_exchange.lower()}"
-                        if alt_code != code:
-                            bs.logout()
+                    if _alt_tries < self._BAOSTOCK_MAX_ALT_TRIES:
+                        alt_symbol = self._alternate_exchange_symbol(symbol)
+                        if alt_symbol and alt_symbol != symbol:
                             return self._fetch_from_baostock(
-                                f"{code_part}.{alt_exchange}", days
+                                alt_symbol, days, _alt_tries=_alt_tries + 1
                             )
                     return pd.DataFrame()
 
@@ -207,9 +218,12 @@ class DataFetcher:
                 df["turnover"] = 0.0
                 return df.dropna().sort_values("date").reset_index(drop=True)
             except Exception as exc:
+                last_exc = exc
                 if attempt < max_retries - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                if last_exc is not None:
+                    raise last_exc
                 raise
             finally:
                 try:
@@ -217,6 +231,16 @@ class DataFetcher:
                 except Exception:
                     pass
         return pd.DataFrame()
+
+    @staticmethod
+    def _alternate_exchange_symbol(symbol: str) -> str | None:
+        """对带 `.SZ/.SH` 后缀的代码，返回另一个交易所的代码；无后缀返回 None。"""
+        parts = symbol.split(".")
+        if len(parts) != 2:
+            return None
+        code_part, exchange = parts
+        alt_exchange = "SH" if exchange.upper() == "SZ" else "SZ"
+        return f"{code_part}.{alt_exchange}"
 
     def _fetch_from_tencent(self, symbol: str, days: int) -> pd.DataFrame:
         end_date = datetime.now().strftime("%Y-%m-%d")

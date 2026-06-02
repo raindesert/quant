@@ -8,7 +8,14 @@ import pandas as pd
 class DataProcessor:
 
     @staticmethod
-    def clean(df: pd.DataFrame) -> pd.DataFrame:
+    def clean(df: pd.DataFrame, max_daily_return: float = 0.3) -> pd.DataFrame:
+        """清洗数据：剔除异常 bar（零价、停牌、单日涨跌幅异常等）。
+
+        Args:
+            df: 原始 OHLCV DataFrame。
+            max_daily_return: 单日涨跌幅绝对值上限，默认 30%。
+                妖股/ST 重组股可能需要放宽到 0.5；正常股票 0.2-0.3 即可。
+        """
         df = df.copy()
         df = df.dropna(subset=["date", "close", "open", "high", "low"])
         df = df[df["close"] > 0]
@@ -19,7 +26,7 @@ class DataProcessor:
         if "volume" in df.columns:
             df.loc[df["volume"] < 0, "volume"] = 0
         daily_returns = df["close"].pct_change()
-        df = df[(daily_returns.abs() < 0.3) | (daily_returns.isna())]
+        df = df[(daily_returns.abs() < max_daily_return) | (daily_returns.isna())]
         df = df.reset_index(drop=True)
         return df
 

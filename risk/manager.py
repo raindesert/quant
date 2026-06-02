@@ -58,23 +58,23 @@ class RiskManager:
         if total_value > self._peak_value:
             self._peak_value = total_value
 
-        if self._prev_day_value <= 0:
-            self._prev_day_value = total_value
+        # 首日没有"昨日"可比较，daily_loss=0 跳过熔断；
+        # 之后每天用上一交易日收盘后的总市值作为基准。
+        if self._prev_day_value > 0:
+            if self._peak_value > 0:
+                drawdown = (self._peak_value - total_value) / self._peak_value
+                if drawdown >= self.max_drawdown_pct:
+                    if not self._circuit_breaker:
+                        self._circuit_breaker = True
+                        self._circuit_breaker_reason = f"组合回撤{drawdown:.1%}超过阈值{self.max_drawdown_pct:.1%}"
+                        logger.warning("熔断触发: %s", self._circuit_breaker_reason)
 
-        if self._peak_value > 0:
-            drawdown = (self._peak_value - total_value) / self._peak_value
-            if drawdown >= self.max_drawdown_pct:
+            daily_loss = (self._prev_day_value - total_value) / self._prev_day_value
+            if daily_loss >= self.max_daily_loss_pct:
                 if not self._circuit_breaker:
                     self._circuit_breaker = True
-                    self._circuit_breaker_reason = f"组合回撤{drawdown:.1%}超过阈值{self.max_drawdown_pct:.1%}"
+                    self._circuit_breaker_reason = f"单日亏损{daily_loss:.1%}超过阈值{self.max_daily_loss_pct:.1%}"
                     logger.warning("熔断触发: %s", self._circuit_breaker_reason)
-
-        daily_loss = (self._prev_day_value - total_value) / self._prev_day_value if self._prev_day_value > 0 else 0
-        if daily_loss >= self.max_daily_loss_pct:
-            if not self._circuit_breaker:
-                self._circuit_breaker = True
-                self._circuit_breaker_reason = f"单日亏损{daily_loss:.1%}超过阈值{self.max_daily_loss_pct:.1%}"
-                logger.warning("熔断触发: %s", self._circuit_breaker_reason)
 
         self._prev_day_value = total_value
 

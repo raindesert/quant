@@ -1,5 +1,6 @@
 """量化交易系统主入口。"""
 import argparse
+import logging
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -80,7 +81,8 @@ def get_strategy(strategy_name: str, symbol: str = "", load_params: bool = False
     """根据名称创建策略实例，支持加载已保存的参数。"""
     strategy_cls = get_strategy_class(strategy_name)
     if strategy_cls is None:
-        print(f"未知策略: {strategy_name}，将使用默认策略 SMA")
+        logger = logging.getLogger("quant")
+        logger.warning("未知策略: %s，将使用默认策略 SMA", strategy_name)
         strategy_cls = get_strategy_class("sma")
 
     if load_params and symbol:
@@ -269,7 +271,7 @@ def run_optimize(args, config, logger):
             score=result.get("best_score"),
             metric=metric,
         )
-        print(f"\n最优参数已自动保存到 params/{strategy_name}_{symbol}.json")
+        logger.info("最优参数已自动保存到 params/%s_%s.json", strategy_name, symbol)
 
     if args.output_json:
         import json
@@ -285,7 +287,7 @@ def run_optimize(args, config, logger):
         }
         with open(args.output_json, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
-        print(f"\n优化结果已导出: {args.output_json}")
+        logger.info("优化结果已导出: %s", args.output_json)
 
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from strategy.base import Signal
 from risk.manager import RiskManager
 
@@ -186,6 +187,54 @@ class BaseBacktestEngine:
         )
         return self.cash + positions_value
 
+    # ==== 公共：一次遍历算 strategy_returns / excess_returns / mean / std ====
+    # 多个指标计算 (Sharpe / Sortino / Beta / IR / Volatility / Quantile)
+    # 都基于日收益率序列。原实现各自循环 O(N)，且 beta/IR 用 O(N²) 线性
+    # 查找 benchmark。这里统一计算并缓存。
+
+    def _strategy_returns(self) -> list[float]:
+        """从 equity_curve 推导日收益率（首日为 NaN 时跳过）。"""
+        values = [e["value"] for e in self.equity_curve]
+        rets = []
+        for i in range(1, len(values)):
+            if values[i - 1] > 0:
+                rets.append((values[i] - values[i - 1]) / values[i - 1])
+        return rets
+
+    def _excess_returns(self) -> list[float]:
+        """日收益率扣减无风险日利率。"""
+        return [r - self.RISK_FREE_RATE_DAILY for r in self._strategy_returns()]
+
+    def _benchmark_index(self) -> dict:
+        """把 benchmark_curve 按 date 建索引，避免 O(N²) 线性查找。"""
+        return {b["date"]: b["value"] for b in self.benchmark_curve}
+
+    def _paired_returns(self) -> tuple[list[float], list[float]]:
+        """返回 (strategy_returns, benchmark_returns)，按 equity_curve 配对。
+
+        benchmark 缺失的日子用上一可用的 value 代替（typical paired return 计算）。
+        """
+        if not self.equity_curve or not self.benchmark_curve:
+            return [], []
+        bm_idx = self._benchmark_index()
+        bm_values = [b["value"] for b in self.benchmark_curve]
+        last_bm = bm_values[0] if bm_values else None
+        s_rets, b_rets = [], []
+        for i in range(1, len(self.equity_curve)):
+            s_prev = self.equity_curve[i - 1]["value"]
+            s_curr = self.equity_curve[i]["value"]
+            if s_prev <= 0:
+                continue
+            # 取当日的 benchmark value；若缺失则用上一个 last_bm
+            bm_curr = bm_idx.get(self.equity_curve[i]["date"], last_bm)
+            bm_prev = bm_idx.get(self.equity_curve[i - 1]["date"], last_bm)
+            if bm_curr is None or bm_prev is None or bm_prev <= 0:
+                continue
+            last_bm = bm_curr
+            s_rets.append((s_curr - s_prev) / s_prev)
+            b_rets.append((bm_curr - bm_prev) / bm_prev)
+        return s_rets, b_rets
+
     def _calc_max_drawdown(self) -> tuple[float, float]:
         if not self.equity_curve:
             return 0.0, 0.0
@@ -216,17 +265,15 @@ class BaseBacktestEngine:
     def _calc_sharpe_ratio(self) -> float:
         if len(self.equity_curve) < 10:
             return 0.0
-        values = [e["value"] for e in self.equity_curve]
-        returns = []
-        for i in range(1, len(values)):
-            if values[i - 1] > 0:
-                ret = (values[i] - values[i - 1]) / values[i - 1]
-                returns.append(ret)
-        if not returns:
+        excess_returns = self._excess_returns()
+        if not excess_returns:
             return 0.0
-        excess_returns = [r - self.RISK_FREE_RATE_DAILY for r in returns]
-        mean_excess = sum(excess_returns) / len(excess_returns)
-        std_ret = math.sqrt(sum((r - mean_excess) ** 2 for r in excess_returns) / len(excess_returns)) if len(excess_returns) > 1 else 0.0
+        n = len(excess_returns)
+        mean_excess = sum(excess_returns) / n
+        if n < 2:
+            return 0.0
+        var = sum((r - mean_excess) ** 2 for r in excess_returns) / n
+        std_ret = math.sqrt(var)
         if std_ret < 1e-10:
             return 0.0
         return (mean_excess / std_ret) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
@@ -241,25 +288,14 @@ class BaseBacktestEngine:
     def _calc_beta(self) -> float:
         if len(self.equity_curve) < 10 or not self.benchmark_curve:
             return 0.0
-        strategy_returns = []
-        benchmark_returns = []
-        for i in range(1, len(self.equity_curve)):
-            s_prev = self.equity_curve[i - 1]["value"]
-            s_curr = self.equity_curve[i]["value"]
-            if s_prev > 0:
-                strategy_returns.append((s_curr - s_prev) / s_prev)
-            bm_date = self.equity_curve[i]["date"]
-            bm_prev = next((b["value"] for b in self.benchmark_curve if b["date"] == self.equity_curve[i - 1]["date"]), None)
-            bm_curr = next((b["value"] for b in self.benchmark_curve if b["date"] == bm_date), None)
-            if bm_prev and bm_prev > 0 and bm_curr:
-                benchmark_returns.append((bm_curr - bm_prev) / bm_prev)
-        if len(strategy_returns) != len(benchmark_returns) or len(strategy_returns) < 2:
+        s_rets, b_rets = self._paired_returns()
+        n = len(s_rets)
+        if n < 2 or len(b_rets) != n:
             return 0.0
-        n = len(strategy_returns)
-        mean_s = sum(strategy_returns) / n
-        mean_b = sum(benchmark_returns) / n
-        cov = sum((strategy_returns[i] - mean_s) * (benchmark_returns[i] - mean_b) for i in range(n)) / n
-        var_b = sum((benchmark_returns[i] - mean_b) ** 2 for i in range(n)) / n
+        mean_s = sum(s_rets) / n
+        mean_b = sum(b_rets) / n
+        cov = sum((s_rets[i] - mean_s) * (b_rets[i] - mean_b) for i in range(n)) / n
+        var_b = sum((b_rets[i] - mean_b) ** 2 for i in range(n)) / n
         if var_b < 1e-10:
             return 0.0
         return cov / var_b
@@ -267,24 +303,14 @@ class BaseBacktestEngine:
     def _calc_information_ratio(self) -> float:
         if len(self.equity_curve) < 10 or not self.benchmark_curve:
             return 0.0
-        strategy_returns = []
-        benchmark_returns = []
-        for i in range(1, len(self.equity_curve)):
-            s_prev = self.equity_curve[i - 1]["value"]
-            s_curr = self.equity_curve[i]["value"]
-            if s_prev > 0:
-                strategy_returns.append((s_curr - s_prev) / s_prev)
-            bm_date = self.equity_curve[i]["date"]
-            bm_prev = next((b["value"] for b in self.benchmark_curve if b["date"] == self.equity_curve[i - 1]["date"]), None)
-            bm_curr = next((b["value"] for b in self.benchmark_curve if b["date"] == bm_date), None)
-            if bm_prev and bm_prev > 0 and bm_curr:
-                benchmark_returns.append((bm_curr - bm_prev) / bm_prev)
-        if len(strategy_returns) != len(benchmark_returns) or len(strategy_returns) < 2:
+        s_rets, b_rets = self._paired_returns()
+        n = len(s_rets)
+        if n < 2 or len(b_rets) != n:
             return 0.0
-        n = len(strategy_returns)
-        excess = [strategy_returns[i] - benchmark_returns[i] for i in range(n)]
+        excess = [s_rets[i] - b_rets[i] for i in range(n)]
         mean_excess = sum(excess) / n
-        std_excess = math.sqrt(sum((e - mean_excess) ** 2 for e in excess) / n) if n > 1 else 0.0
+        var = sum((e - mean_excess) ** 2 for e in excess) / n
+        std_excess = math.sqrt(var)
         if std_excess < 1e-10:
             return 0.0
         return (mean_excess / std_excess) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
@@ -292,14 +318,13 @@ class BaseBacktestEngine:
     def _calc_annual_volatility(self) -> float:
         if len(self.equity_curve) < 10:
             return 0.0
-        values = [e["value"] for e in self.equity_curve]
-        returns = []
-        for i in range(1, len(values)):
-            if values[i - 1] > 0:
-                returns.append((values[i] - values[i - 1]) / values[i - 1])
-        if not returns:
+        returns = self._strategy_returns()
+        if len(returns) < 2:
             return 0.0
-        std_ret = math.sqrt(sum((r - sum(returns) / len(returns)) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.0
+        n = len(returns)
+        mean = sum(returns) / n
+        var = sum((r - mean) ** 2 for r in returns) / n
+        std_ret = math.sqrt(var)
         return std_ret * math.sqrt(self.TRADING_DAYS_PER_YEAR) * 100
 
     def _calc_calmar_ratio(self) -> float:
@@ -310,19 +335,24 @@ class BaseBacktestEngine:
         return annual_return / max_dd_pct
 
     def _calc_sortino_ratio(self) -> float:
+        """Sortino 比率 = 超额收益均值 / 下行标准差。
+
+        下行标准差采用 "zero target" 法：
+            downside_dev = sqrt( sum(min(r_i, 0)^2) / N )
+        即只对负收益取平方，分母用全部观测数 N（与原始 Sortino 1981 论文一致）。
+        """
         if len(self.equity_curve) < 10:
             return 0.0
-        values = [e["value"] for e in self.equity_curve]
-        returns = []
-        for i in range(1, len(values)):
-            if values[i - 1] > 0:
-                returns.append((values[i] - values[i - 1]) / values[i - 1])
-        if not returns:
+        excess_returns = self._excess_returns()
+        if not excess_returns:
             return 0.0
-        excess_returns = [r - self.RISK_FREE_RATE_DAILY for r in returns]
-        mean_excess = sum(excess_returns) / len(excess_returns)
-        downside_excess = [r for r in excess_returns if r < 0]
-        downside_std = math.sqrt(sum(r ** 2 for r in downside_excess) / len(excess_returns)) if downside_excess else 0.0
+        n = len(excess_returns)
+        mean_excess = sum(excess_returns) / n
+        # 只对负值（excess < 0）取平方，正值贡献为 0
+        sum_sq_down = sum(r * r for r in excess_returns if r < 0)
+        if sum_sq_down <= 0:
+            return 0.0
+        downside_std = math.sqrt(sum_sq_down / n)
         if downside_std < 1e-10:
             return 0.0
         return (mean_excess / downside_std) * math.sqrt(self.TRADING_DAYS_PER_YEAR)
@@ -349,14 +379,11 @@ class BaseBacktestEngine:
     def _calc_quantile_stats(self) -> dict:
         if not self.equity_curve or len(self.equity_curve) < 2:
             return {}
-        values = [e["value"] for e in self.equity_curve]
-        returns = []
-        for i in range(1, len(values)):
-            if values[i - 1] > 0:
-                returns.append((values[i] - values[i - 1]) / values[i - 1] * 100)
+        returns = self._strategy_returns()
         if not returns:
             return {}
-        sorted_returns = sorted(returns)
+        returns_pct = [r * 100 for r in returns]
+        sorted_returns = sorted(returns_pct)
         n = len(sorted_returns)
         return {
             "best_day": sorted_returns[-1] if n > 0 else 0.0,
