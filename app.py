@@ -1,4 +1,14 @@
-"""A股量化交易系统 - Streamlit图形化界面"""
+"""A股量化交易系统 - Streamlit 图形化界面 (v5)
+
+页面:
+  - 📊 单策略回测 (含分钟级 + HTML 报告下载)
+  - ⚔️ 策略对比
+  - 🔧 参数优化 (含贝叶斯/随机搜索)
+  - 🔀 多策略组合
+  - 📁 YAML 预设
+  - 🔄 Walk-Forward
+  - 📡 实时行情
+"""
 import sys
 from pathlib import Path
 
@@ -13,8 +23,11 @@ import yaml
 
 from strategy.registry import STRATEGY_REGISTRY, create_strategy, get_strategy_class, list_strategies
 from backtest.engine import BacktestEngine
-from backtest.optimizer import StrategyOptimizer, DEFAULT_GRIDS, OPTIMIZE_METRICS
+from backtest.optimizer import StrategyOptimizer, DEFAULT_GRIDS, OPTIMIZE_METRICS, OptimizeMethod
+from backtest.multi_strategy import MultiStrategyEngine
+from backtest.output import export_html_report
 from backtest.walk_forward import WalkForwardValidator
+from config.loader import load_config as load_user_config, merge_config_with_args
 from data.fetcher import DataFetcher
 from data.processor import DataProcessor
 from risk.manager import RiskManager
@@ -23,10 +36,25 @@ from risk.manager import RiskManager
 def load_config():
     config_path = Path(__file__).parent / "config" / "settings.yaml"
     with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
 CONFIG = load_config()
+
+# 页面常量 — 用枚举避免字符串匹配
+PAGE_BACKTEST = "📊 单策略回测"
+PAGE_COMPARISON = "⚔️ 策略对比"
+PAGE_OPTIMIZE = "🔧 参数优化"
+PAGE_MULTI_STRATEGY = "🔀 多策略组合"
+PAGE_YAML = "📁 YAML 预设"
+PAGE_WALK_FORWARD = "🔄 Walk-Forward"
+PAGE_REALTIME = "📡 实时行情"
+
+ALL_PAGES = [
+    PAGE_BACKTEST, PAGE_COMPARISON, PAGE_OPTIMIZE, PAGE_MULTI_STRATEGY,
+    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME,
+]
+
 
 st.set_page_config(
     page_title="A股量化交易系统",
@@ -46,18 +74,39 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def render_sidebar():
+@st.cache_data(ttl=3600, show_spinner="正在获取行情...")
+def _fetch_cached(symbol: str, days: int, frequency: str = "day"):
+    """缓存数据获取，避免重复请求。"""
+    fetcher = DataFetcher()
+    return fetcher.get_history(symbol, days=days, frequency=frequency)
+
+
+def render_sidebar() -> str:
+    """渲染侧边栏 + 共享的全局参数。
+
+    返回选中的页面常量。
+    """
     with st.sidebar:
         st.title("📈 A股量化交易系统")
         st.markdown("---")
-        page = st.radio(
-            "功能导航",
-            ["📊 单策略回测", "⚔️ 策略对比", "🔧 参数优化", "🔄 Walk-Forward", "📡 实时行情"],
-            label_visibility="collapsed",
-        )
+        page = st.radio("功能导航", ALL_PAGES, label_visibility="collapsed")
+
         st.markdown("---")
-        st.caption("v4.0 | A股量化交易系统")
-        return page
+        st.markdown("### 全局参数")
+        # 共享参数（所有 page 都能访问）
+        st.session_state.setdefault("global_symbol", CONFIG.get("default_symbol", "000001.SZ"))
+        st.session_state["global_symbol"] = st.text_input(
+            "默认股票代码", value=st.session_state["global_symbol"],
+            help="各页面默认使用此代码",
+        )
+        st.session_state.setdefault("global_days", CONFIG.get("backtest", {}).get("days", 250))
+        st.session_state["global_days"] = st.slider(
+            "默认回测天数", 30, 500, st.session_state["global_days"],
+        )
+
+        st.markdown("---")
+        st.caption("v5.0 | A股量化交易系统")
+    return page
 
 
 def metric_card(col, label, value, fmt=".2f", suffix="", is_pct=False):
@@ -205,27 +254,48 @@ def page_backtest():
 
     with st.sidebar:
         st.markdown("### 回测参数")
-        symbol = st.text_input("股票代码", value=CONFIG.get("default_symbol", "000001.SZ"))
-        strategy_name = st.selectbox("策略", list_strategies(), format_func=lambda x: x.upper())
-        days = st.slider("回测天数", 30, 500, CONFIG.get("backtest", {}).get("days", 250))
+        # 用全局参数作默认值
+        symbol = st.text_input(
+            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+            key="bt_symbol",
+        )
+        strategy_name = st.selectbox(
+            "策略", list_strategies(), format_func=lambda x: x.upper(),
+            key="bt_strategy",
+        )
+        days = st.slider(
+            "回测天数", 30, 500,
+            value=st.session_state.get("global_days", 250),
+            key="bt_days",
+        )
+        # 新功能: 分钟级回测
+        frequency = st.selectbox(
+            "K线频率",
+            ["day", "m1", "m5", "m15", "m30", "m60"],
+            index=0,
+            format_func=lambda x: {"day": "日线", "m1": "1分", "m5": "5分",
+                                    "m15": "15分", "m30": "30分", "m60": "60分"}.get(x, x),
+            help="分钟级回测时 T+1 和涨跌停检查自动禁用",
+            key="bt_freq",
+        )
 
         st.markdown("#### 交易参数")
         col1, col2 = st.columns(2)
         with col1:
-            stop_loss = st.number_input("止损比例", 0.0, 0.5, 0.0, 0.01, format="%.2f")
-            position_size = st.number_input("仓位比例", 0.1, 1.0, 1.0, 0.1, format="%.1f")
+            stop_loss = st.number_input("止损比例", 0.0, 0.5, 0.0, 0.01, format="%.2f", key="bt_sl")
+            position_size = st.number_input("仓位比例", 0.1, 1.0, 1.0, 0.1, format="%.1f", key="bt_ps")
         with col2:
-            take_profit = st.number_input("止盈比例", 0.0, 1.0, 0.0, 0.05, format="%.2f")
-            slippage = st.number_input("滑点(%)", 0.0, 1.0, 0.1, 0.01, format="%.2f")
+            take_profit = st.number_input("止盈比例", 0.0, 1.0, 0.0, 0.05, format="%.2f", key="bt_tp")
+            slippage = st.number_input("滑点(%)", 0.0, 1.0, 0.1, 0.01, format="%.2f", key="bt_slip")
 
         st.markdown("#### 风控设置")
-        risk_enabled = st.checkbox("启用风控", value=CONFIG.get("risk", {}).get("enabled", True))
+        risk_enabled = st.checkbox("启用风控", value=CONFIG.get("risk", {}).get("enabled", True), key="bt_risk")
         if risk_enabled:
-            max_position_pct = st.slider("单股仓位上限", 0.05, 0.5, 0.25, 0.05)
-            max_positions = st.slider("最大持仓数", 1, 20, 10)
-            max_drawdown_pct = st.slider("最大回撤熔断", 0.05, 0.5, 0.2, 0.05)
-            max_daily_loss_pct = st.slider("日亏损上限", 0.01, 0.1, 0.03, 0.01)
-            max_stock_loss_pct = st.slider("个股亏损上限", 0.05, 0.3, 0.1, 0.05)
+            max_position_pct = st.slider("单股仓位上限", 0.05, 0.5, 0.25, 0.05, key="bt_mp")
+            max_positions = st.slider("最大持仓数", 1, 20, 10, key="bt_mps")
+            max_drawdown_pct = st.slider("最大回撤熔断", 0.05, 0.5, 0.2, 0.05, key="bt_md")
+            max_daily_loss_pct = st.slider("日亏损上限", 0.01, 0.1, 0.03, 0.01, key="bt_dl")
+            max_stock_loss_pct = st.slider("个股亏损上限", 0.05, 0.3, 0.1, 0.05, key="bt_slmax")
         else:
             max_position_pct = 0.25
             max_positions = 10
@@ -233,31 +303,38 @@ def page_backtest():
             max_daily_loss_pct = 0.03
             max_stock_loss_pct = 0.1
 
-    if st.button("🚀 开始回测", type="primary", use_container_width=True):
-        with st.spinner(f"正在回测 {symbol} ..."):
-            strategy = create_strategy(strategy_name)
-            risk_manager = build_risk_manager(
-                risk_enabled, max_position_pct, max_positions,
-                max_drawdown_pct, max_daily_loss_pct, max_stock_loss_pct,
-            )
-            engine = BacktestEngine(
-                initial_cash=CONFIG.get("initial_cash", 1_000_000),
-                commission=CONFIG.get("backtest", {}).get("commission", 0.0003),
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                position_size=position_size,
-                slippage=slippage / 100,
-                slippage_type="percent",
-                enforce_t_plus_1=True,
-                check_limit=True,
-                risk_manager=risk_manager,
-            )
-            summary = engine.run(strategy, symbol, days=days)
+    if st.button("🚀 开始回测", type="primary", use_container_width=True, key="bt_go"):
+        with st.spinner(f"正在回测 {symbol} ({frequency})..."):
+            try:
+                strategy = create_strategy(strategy_name)
+                risk_manager = build_risk_manager(
+                    risk_enabled, max_position_pct, max_positions,
+                    max_drawdown_pct, max_daily_loss_pct, max_stock_loss_pct,
+                )
+                engine = BacktestEngine(
+                    initial_cash=CONFIG.get("initial_cash", 1_000_000),
+                    commission=CONFIG.get("backtest", {}).get("commission", 0.0003),
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    position_size=position_size,
+                    slippage=slippage / 100,
+                    slippage_type="percent",
+                    enforce_t_plus_1=True,
+                    check_limit=True,
+                    risk_manager=risk_manager,
+                )
+                summary = engine.run(strategy, symbol, days=days, frequency=frequency)
+            except Exception as exc:
+                st.error(f"回测失败: {exc}")
+                return
 
         if summary is None:
             st.error(f"无法获取 {symbol} 的数据，请检查股票代码或网络连接")
             return
 
+        # 加 strategy 字段到 summary（让 HTML 报告标题能正确显示）
+        summary["strategy"] = strategy_name
+        summary["symbol"] = symbol
         st.session_state["last_summary"] = summary
         st.session_state["last_symbol"] = symbol
         st.session_state["last_strategy"] = strategy_name
@@ -269,6 +346,26 @@ def page_backtest():
 
         st.subheader(f"{symbol} | {strategy_name.upper()} 策略回测结果")
         display_summary_metrics(summary)
+
+        # 新功能: HTML 报告下载按钮
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            try:
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+                    html_path = Path(f.name)
+                export_html_report(summary, html_path)
+                html_bytes = html_path.read_bytes()
+                html_path.unlink()
+                st.download_button(
+                    "📥 下载 HTML 报告",
+                    data=html_bytes,
+                    file_name=f"{symbol}_{strategy_name}_report.html",
+                    mime="text/html",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.warning(f"HTML 报告生成失败: {exc}")
 
         tab1, tab2, tab3, tab4 = st.tabs(["📈 权益曲线", "🗓️ 月度热力图", "📋 交易明细", "📊 详细指标"])
 
@@ -400,11 +497,41 @@ def page_optimize():
 
     with st.sidebar:
         st.markdown("### 优化参数")
-        symbol = st.text_input("股票代码", value="000001.SZ", key="opt_symbol")
-        strategy_name = st.selectbox("策略", list_strategies(), key="opt_strategy")
-        days = st.slider("回测天数", 60, 500, 250, key="opt_days")
-        metric = st.selectbox("优化指标", list(OPTIMIZE_METRICS.keys()),
-                              format_func=lambda x: OPTIMIZE_METRICS[x])
+        symbol = st.text_input(
+            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+            key="opt_symbol",
+        )
+        strategy_name = st.selectbox(
+            "策略", list_strategies(), key="opt_strategy",
+        )
+        days = st.slider(
+            "回测天数", 60, 500,
+            value=st.session_state.get("global_days", 250),
+            key="opt_days",
+        )
+        metric = st.selectbox(
+            "优化指标", list(OPTIMIZE_METRICS.keys()),
+            format_func=lambda x: OPTIMIZE_METRICS[x],
+            key="opt_metric",
+        )
+        # 新功能: 优化方法（grid / random / bayesian）
+        method_label = st.selectbox(
+            "优化方法",
+            ["grid", "random", "bayesian"],
+            index=0,
+            format_func=lambda x: {
+                "grid": "Grid 暴力搜索",
+                "random": "Random 随机搜索",
+                "bayesian": "Bayesian 贝叶斯 (TPE)",
+            }.get(x),
+            help="贝叶斯在大范围参数时显著优于 Grid",
+            key="opt_method",
+        )
+        n_trials = st.slider(
+            "采样次数 (random/bayesian)", 10, 200, 50,
+            disabled=(method_label == "grid"),
+            key="opt_trials",
+        )
 
     strategy_cls = get_strategy_class(strategy_name)
     if strategy_cls is None:
@@ -436,7 +563,7 @@ def page_optimize():
                 v += step_f
             custom_grid[param_name] = vals
 
-    if st.button("🚀 开始优化", type="primary", use_container_width=True):
+    if st.button("🚀 开始优化", type="primary", use_container_width=True, key="opt_go"):
         optimizer = StrategyOptimizer(
             strategy_name=strategy_name,
             symbol=symbol,
@@ -444,21 +571,30 @@ def page_optimize():
             metric=metric,
         )
 
-        with st.spinner("优化中，请稍候..."):
-            result = optimizer.optimize(custom_grid)
+        with st.spinner(f"优化中 ({method_label})，请稍候..."):
+            result = optimizer.optimize(
+                custom_grid, method=method_label, n_trials=n_trials,
+            )
 
         st.session_state["opt_result"] = result
+        st.session_state["opt_metric_used"] = metric
 
     if "opt_result" not in st.session_state:
         return
 
     result = st.session_state["opt_result"]
+    metric_used = st.session_state.get("opt_metric_used", metric)
 
     st.subheader("优化结果")
 
     best = result.get("best_params", {})
     best_score = result.get("best_score", 0)
-    st.success(f"最优参数: {best} | {OPTIMIZE_METRICS.get(metric, metric)}: {best_score:.4f}")
+    st.success(f"最优参数: {best} | {OPTIMIZE_METRICS.get(metric_used, metric_used)}: {best_score:.4f}")
+
+    # 新功能: 显示 trials 数
+    n_trials_done = result.get("n_trials")
+    if n_trials_done is not None:
+        st.caption(f"完成 {n_trials_done} trials（{method_label}）")
 
     all_results = result.get("all_results", [])
     if all_results:
@@ -470,11 +606,235 @@ def page_optimize():
             rows.append(row)
 
         df = pd.DataFrame(rows)
-        sort_col = OPTIMIZE_METRICS.get(metric, metric)
+        sort_col = OPTIMIZE_METRICS.get(metric_used, metric_used)
         if sort_col in df.columns:
-            ascending = metric == "max_drawdown_pct"
+            ascending = metric_used == "max_drawdown_pct"
             df = df.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
         st.dataframe(df, use_container_width=True, height=400)
+
+
+def page_multi_strategy():
+    """多策略并行组合回测 (P2-2)."""
+    st.header("🔀 多策略并行组合")
+
+    with st.sidebar:
+        st.markdown("### 组合参数")
+        symbol = st.text_input(
+            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+            key="ms_symbol",
+        )
+        days = st.slider(
+            "回测天数", 30, 500,
+            value=st.session_state.get("global_days", 250),
+            key="ms_days",
+        )
+        strategies_text = st.text_input(
+            "策略列表 (逗号分隔)",
+            value="sma,rsi,bollinger",
+            help="如 sma,rsi,bollinger,kdj",
+            key="ms_strategies",
+        )
+        weights_text = st.text_input(
+            "权重 (逗号分隔, 总和=1)",
+            value="0.4,0.3,0.3",
+            help="如 0.4,0.3,0.3；留空则等分",
+            key="ms_weights",
+        )
+
+    if st.button("🚀 开始组合回测", type="primary", use_container_width=True, key="ms_go"):
+        strategies = [s.strip() for s in strategies_text.split(",") if s.strip()]
+        if not strategies:
+            st.error("请输入至少一个策略")
+            return
+
+        weights = None
+        if weights_text.strip():
+            try:
+                weights = [float(w.strip()) for w in weights_text.split(",") if w.strip()]
+            except ValueError as exc:
+                st.error(f"权重解析失败: {exc}")
+                return
+
+        with st.spinner(f"并发回测 {len(strategies)} 个策略..."):
+            try:
+                engine = MultiStrategyEngine(
+                    strategies=strategies,
+                    symbol=symbol,
+                    days=days,
+                    initial_cash=CONFIG.get("initial_cash", 1_000_000),
+                    commission=CONFIG.get("backtest", {}).get("commission", 0.0003),
+                    weights=weights,
+                )
+                result = engine.run()
+            except Exception as exc:
+                st.error(f"组合回测失败: {exc}")
+                return
+
+        st.session_state["ms_result"] = result
+
+    if "ms_result" not in st.session_state:
+        return
+
+    result = st.session_state["ms_result"]
+    sub_results = result.get("strategies", [])
+    combined = result.get("combined", {})
+
+    st.subheader(f"{symbol} 多策略组合结果")
+
+    # 子策略表格
+    rows = []
+    for r in sub_results:
+        if "error" in r:
+            rows.append({"策略": r.get("strategy", "?"), "状态": f"❌ {r['error']}"})
+        else:
+            rows.append({
+                "策略": r.get("strategy", "?").upper(),
+                "收益率%": f"{r.get('profit_pct', 0):+.2f}",
+                "夏普": f"{r.get('sharpe_ratio', 0):.2f}",
+                "回撤%": f"{r.get('max_drawdown_pct', 0):.2f}",
+                "交易数": r.get("trades", 0),
+            })
+    rows.append({
+        "策略": "【组合】",
+        "收益率%": f"{combined.get('profit_pct', 0):+.2f}",
+        "夏普": f"{combined.get('sharpe_ratio', 0):.2f}",
+        "回撤%": f"{combined.get('max_drawdown_pct', 0):.2f}",
+        "交易数": combined.get("trades", 0),
+    })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # 组合权益曲线
+    eq = combined.get("equity_curve", [])
+    if eq:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=[e["date"] for e in eq],
+            y=[e["value"] for e in eq],
+            name="组合", line=dict(color="#58a6ff", width=2.5),
+        ))
+        # 也画每个子策略
+        for r in sub_results:
+            if "error" in r:
+                continue
+            sub_eq = r.get("equity_curve", [])
+            if sub_eq:
+                fig.add_trace(go.Scatter(
+                    x=[e["date"] for e in sub_eq],
+                    y=[e["value"] for e in sub_eq],
+                    name=r.get("strategy", "?").upper(),
+                    line=dict(width=1, dash="dash"), opacity=0.5,
+                ))
+        fig.update_layout(
+            title="组合 vs 子策略权益曲线",
+            height=500, yaxis_title="权益",
+            legend=dict(orientation="h", y=1.02),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # HTML 报告下载
+    if eq:
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+                html_path = Path(f.name)
+            combined["strategy"] = "【组合】"
+            combined["symbol"] = symbol
+            export_html_report(combined, html_path)
+            html_bytes = html_path.read_bytes()
+            html_path.unlink()
+            st.download_button(
+                "📥 下载组合 HTML 报告",
+                data=html_bytes,
+                file_name=f"{symbol}_multi_strategy_report.html",
+                mime="text/html",
+            )
+        except Exception as exc:
+            st.warning(f"HTML 报告生成失败: {exc}")
+
+
+def page_yaml_preset():
+    """YAML 预设加载/保存 (P1-5)."""
+    st.header("📁 YAML 配置预设")
+
+    st.markdown("""
+    预设可保存常用回测配置，复用时 `--config presets/xxx.yaml` 一行启动。
+    """)
+
+    presets_dir = Path(__file__).parent / "presets"
+    presets_dir.mkdir(exist_ok=True)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("加载现有预设")
+        yaml_files = sorted(presets_dir.glob("*.yaml")) + sorted(presets_dir.glob("*.yml"))
+        yaml_files = [f for f in yaml_files if f.is_file()]
+        if not yaml_files:
+            st.info("暂无预设")
+        else:
+            selected = st.selectbox(
+                "选择预设",
+                yaml_files,
+                format_func=lambda p: p.name,
+                key="yaml_load_select",
+            )
+            if selected:
+                try:
+                    cfg = load_user_config(selected)
+                    st.success(f"已加载 {selected.name}（{len(cfg)} 字段）")
+                    st.json(cfg)
+
+                    st.markdown("#### 用此预设启动回测")
+                    if st.button("🚀 用此配置回测", key="yaml_run"):
+                        symbol = cfg.get("symbol", "000001.SZ")
+                        strategy = cfg.get("strategy", "sma")
+                        try:
+                            strat_obj = create_strategy(strategy)
+                            eng = BacktestEngine(
+                                initial_cash=cfg.get("initial_cash", 1_000_000),
+                                commission=cfg.get("commission", 0.0003),
+                                stop_loss=cfg.get("stop_loss", 0.0),
+                                take_profit=cfg.get("take_profit", 0.0),
+                                position_size=cfg.get("position_size", 1.0),
+                            )
+                            summary = eng.run(strat_obj, symbol, days=cfg.get("days", 250))
+                            if summary:
+                                summary["strategy"] = strategy
+                                summary["symbol"] = symbol
+                                st.session_state["last_summary"] = summary
+                                st.success("回测完成")
+                            else:
+                                st.error("回测失败")
+                        except Exception as exc:
+                            st.error(f"运行失败: {exc}")
+                except Exception as exc:
+                    st.error(f"加载失败: {exc}")
+
+    with col2:
+        st.subheader("快速创建预设")
+        with st.form("yaml_create"):
+            name = st.text_input("预设名 (不含后缀)", value="my_strategy")
+            mode = st.selectbox("mode", ["backtest", "optimize", "walkforward", "multi_strategy"])
+            strategy = st.selectbox("strategy", list_strategies())
+            symbol = st.text_input("symbol", value="000001.SZ")
+            days = st.number_input("days", 30, 500, 250)
+            stop_loss = st.number_input("stop_loss", 0.0, 0.5, 0.0, 0.01, format="%.2f")
+            take_profit = st.number_input("take_profit", 0.0, 1.0, 0.0, 0.05, format="%.2f")
+            position_size = st.number_input("position_size", 0.1, 1.0, 1.0, 0.1, format="%.1f")
+            submitted = st.form_submit_button("💾 保存预设")
+            if submitted:
+                preset_data = {
+                    "mode": mode, "strategy": strategy, "symbol": symbol,
+                    "days": days, "stop_loss": stop_loss, "take_profit": take_profit,
+                    "position_size": position_size,
+                }
+                target = presets_dir / f"{name}.yaml"
+                try:
+                    with open(target, "w", encoding="utf-8") as f:
+                        yaml.dump(preset_data, f, allow_unicode=True, default_flow_style=False)
+                    st.success(f"已保存: {target}")
+                except Exception as exc:
+                    st.error(f"保存失败: {exc}")
 
 
 def page_walk_forward():
@@ -482,13 +842,16 @@ def page_walk_forward():
 
     with st.sidebar:
         st.markdown("### WF 参数")
-        symbol = st.text_input("股票代码", value="000001.SZ", key="wf_symbol")
+        symbol = st.text_input(
+            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+            key="wf_symbol",
+        )
         strategy_name = st.selectbox("策略", list_strategies(), key="wf_strategy")
         train_days = st.slider("训练期(天)", 60, 250, 120, key="wf_train")
         test_days = st.slider("测试期(天)", 20, 120, 60, key="wf_test")
         step_days = st.slider("步进(天)", 20, 120, 60, key="wf_step")
 
-    if st.button("🚀 开始验证", type="primary", use_container_width=True):
+    if st.button("🚀 开始验证", type="primary", use_container_width=True, key="wf_go"):
         validator = WalkForwardValidator(
             strategy_name=strategy_name,
             symbol=symbol,
@@ -594,19 +957,25 @@ def page_realtime():
             st.rerun()
 
 
+# 页面路由表 — 精确匹配常量，避免字符串包含误判
+_PAGE_ROUTER = {
+    PAGE_BACKTEST: page_backtest,
+    PAGE_COMPARISON: page_strategy_comparison,
+    PAGE_OPTIMIZE: page_optimize,
+    PAGE_MULTI_STRATEGY: page_multi_strategy,
+    PAGE_YAML: page_yaml_preset,
+    PAGE_WALK_FORWARD: page_walk_forward,
+    PAGE_REALTIME: page_realtime,
+}
+
+
 def main():
     page = render_sidebar()
-
-    if "📊" in page:
-        page_backtest()
-    elif "⚔️" in page:
-        page_strategy_comparison()
-    elif "🔧" in page:
-        page_optimize()
-    elif "🔄" in page:
-        page_walk_forward()
-    elif "📡" in page:
-        page_realtime()
+    handler = _PAGE_ROUTER.get(page)
+    if handler is None:
+        st.error(f"未知页面: {page}")
+        return
+    handler()
 
 
 if __name__ == "__main__":
