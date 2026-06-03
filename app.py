@@ -1431,6 +1431,9 @@ def _render_kline_section(symbol: str, key_prefix: str = ""):
     # ============== 技术指标副图 (v25 新增) ==============
     _render_indicator_section(df)
 
+    # ============== 买卖点标记 (v26 新增) ==============
+    _render_buy_sell_section(df, symbol, freq)
+
 
 def _render_indicator_section(df):
     """渲染 3 个技术指标副图 (MACD / RSI / KDJ)。
@@ -1575,6 +1578,319 @@ def _render_indicator_section(df):
     # 简表
     with st.expander("📋 原始数据", expanded=False):
         st.dataframe(df.tail(20), use_container_width=True)
+
+
+def _render_buy_sell_section(df, symbol: str, freq: str):
+    """渲染买卖点标记 section。
+
+    三种数据源:
+    1. 🚀 跑回测 — 实时跑一次 BacktestEngine，结果叠在 K 线上
+    2. 📤 上传 CSV — 读用户上传的 trades.csv
+    3. ✍️ 手动输入 — 通过 data_editor 输买卖点
+
+    trades 格式: [{date, action ('buy'/'sell'), price, quantity, ...}, ...]
+    """
+    from utils.watchlist import _normalize_symbol as _norm
+
+    with st.expander("🎯 买卖点标记", expanded=False):
+        st.caption("在 K 线上叠加 ▲ 买 / ▼ 卖标记，便于回测验证和策略调试")
+
+        # 选数据源
+        source = st.radio(
+            "数据源",
+            ["🚀 跑一次回测", "📤 上传 CSV", "✍️ 手动输入"],
+            key=f"bs_source_{symbol}_{freq}",
+            horizontal=True,
+        )
+
+        trades = []
+
+        if source == "🚀 跑一次回测":
+            trades = _run_quick_backtest_for_chart(symbol, freq, key_prefix=f"bs_bt_{symbol}_{freq}")
+        elif source == "📤 上传 CSV":
+            trades = _load_trades_from_csv_upload(key=f"bs_upload_{symbol}_{freq}")
+        elif source == "✍️ 手动输入":
+            trades = _manual_trade_input(key_prefix=f"bs_manual_{symbol}_{freq}")
+
+        if not trades:
+            st.info("没有可显示的买卖点")
+            return
+
+        # 在 K 线上画标记
+        st.markdown(f"#### 共 {len(trades)} 个买卖点")
+        _display_trades_table(trades)
+
+        # 算胜负
+        wins, losses, total = _calc_trade_pnl(trades)
+        if total > 0:
+            cols = st.columns(3)
+            cols[0].metric("总交易", total)
+            cols[1].metric("盈利", wins, help="盈亏>0 的回合")
+            cols[2].metric("亏损", losses, help="盈亏<0 的回合")
+
+        # 给 df 加 _has_trade 列
+        df_marked = _mark_df_with_trades(df, trades)
+        if df_marked is not None:
+            fig_with_markers = _build_kline_with_markers(df_marked, trades, symbol, freq)
+            st.plotly_chart(fig_with_markers, use_container_width=True)
+
+
+def _run_quick_backtest_for_chart(symbol: str, freq: str, key_prefix: str = "") -> list:
+    """跑一次回测，返 trades 列表（仅支持日线/分钟线）。"""
+    from strategy.registry import list_strategies
+
+    cols = st.columns(2)
+    with cols[0]:
+        strategies = list_strategies()
+        strat = st.selectbox(
+            "策略", strategies, index=0,
+            format_func=lambda x: x.upper(),
+            key=f"{key_prefix}_strat",
+        )
+    with cols[1]:
+        days = st.number_input("回测天数", 30, 500, 120, 30, key=f"{key_prefix}_days")
+
+    trades = st.session_state.get(f"{key_prefix}_trades")
+    last_run = st.session_state.get(f"{key_prefix}_last_run", "")
+
+    if st.button("▶️ 跑回测", key=f"{key_prefix}_run", use_container_width=True):
+        try:
+            from backtest.engine import BacktestEngine
+            from strategy.registry import create_strategy
+            engine = BacktestEngine(initial_cash=1_000_000, commission=0.0003)
+            strategy = create_strategy(strat)
+            with st.spinner(f"回测 {symbol} {strat} {days} 天..."):
+                summary = engine.run(strategy, symbol, days=days)
+            trades = summary.get("trades_list", []) if summary else []
+            st.session_state[f"{key_prefix}_trades"] = trades
+            st.session_state[f"{key_prefix}_last_run"] = f"{symbol}/{strat}/{days}d"
+            if not trades:
+                st.info("回测未产生交易（可能条件未触发）")
+            else:
+                st.success(f"产生 {len(trades)} 笔交易")
+        except Exception as exc:
+            st.error(f"回测失败: {exc}")
+            return []
+    elif trades and last_run:
+        st.caption(f"上次回测: {last_run}（{len(trades)} 笔交易）")
+
+    return trades or []
+
+
+def _load_trades_from_csv_upload(key: str) -> list:
+    """读取用户上传的 CSV 转换为 trades 列表。
+
+    CSV 必含列: date, action, price
+    可选: quantity, entry_price, commission_cost
+    """
+    uploaded = st.file_uploader(
+        "上传 trades.csv (列: date, action, price, [quantity, entry_price])",
+        type=["csv"], key=key,
+    )
+    if uploaded is None:
+        st.caption("CSV 示例: date,action,price,quantity\n2026-01-15,buy,10.5,1000")
+        return []
+
+    try:
+        import pandas as pd
+        df = pd.read_csv(uploaded)
+        required = {"date", "action", "price"}
+        if not required.issubset(df.columns):
+            st.error(f"CSV 缺必填列: {required - set(df.columns)}")
+            return []
+        trades = []
+        for _, row in df.iterrows():
+            trades.append({
+                "date": str(row["date"]),
+                "action": str(row["action"]).strip().lower(),
+                "price": float(row["price"]),
+                "quantity": int(row.get("quantity", 0)) if pd.notna(row.get("quantity")) else 0,
+            })
+        st.success(f"加载 {len(trades)} 笔交易")
+        return trades
+    except Exception as exc:
+        st.error(f"CSV 解析失败: {exc}")
+        return []
+
+
+def _manual_trade_input(key_prefix: str = "") -> list:
+    """通过 data_editor 让用户手动输入买卖点。"""
+    import pandas as pd
+    if f"{key_prefix}_editor" not in st.session_state:
+        st.session_state[f"{key_prefix}_editor"] = pd.DataFrame({
+            "date": ["2026-01-15", "2026-02-20"],
+            "action": ["buy", "sell"],
+            "price": [10.5, 11.2],
+            "quantity": [1000, 1000],
+        })
+    edited = st.data_editor(
+        st.session_state[f"{key_prefix}_editor"],
+        num_rows="dynamic",
+        key=f"{key_prefix}_data_editor",
+        use_container_width=True,
+        column_config={
+            "date": st.column_config.TextColumn("日期 (YYYY-MM-DD)"),
+            "action": st.column_config.SelectboxColumn(
+                "方向", options=["buy", "sell"], required=True
+            ),
+            "price": st.column_config.NumberColumn("价格", min_value=0.0, format="%.2f"),
+            "quantity": st.column_config.NumberColumn("数量", min_value=0, step=100),
+        },
+    )
+    st.session_state[f"{key_prefix}_editor"] = edited
+    if st.button("✅ 应用", key=f"{key_prefix}_apply", use_container_width=True):
+        trades = []
+        for _, row in edited.iterrows():
+            try:
+                trades.append({
+                    "date": str(row["date"]),
+                    "action": str(row["action"]).strip().lower(),
+                    "price": float(row["price"]),
+                    "quantity": int(row.get("quantity", 0)) if pd.notna(row.get("quantity")) else 0,
+                })
+            except Exception:
+                continue
+        return trades
+    return []
+
+
+def _display_trades_table(trades: list):
+    """显示买卖点表格。"""
+    import pandas as pd
+    rows = []
+    for t in trades[:50]:  # 限前 50
+        date_raw = t.get("date", "")
+        date_str = date_raw.strftime("%Y-%m-%d") if hasattr(date_raw, "strftime") else str(date_raw)
+        action = t.get("action", "")
+        side_emoji = "🟢" if action == "buy" else "🔴" if action == "sell" else "⚪"
+        qty = t.get("quantity", 0) or 0
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            qty = 0
+        price = t.get("price", 0) or 0
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            price = 0.0
+        rows.append({
+            "日期": date_str,
+            "方向": f"{side_emoji} {action}",
+            "价格": f"{price:.2f}",
+            "数量": qty,
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if len(trades) > 50:
+        st.caption(f"（仅显示前 50 条，共 {len(trades)} 条）")
+
+
+def _calc_trade_pnl(trades: list) -> tuple[int, int, int]:
+    """用 buy-sell 配对算胜负。返 (wins, losses, total_pairs)。"""
+    open_pos = None
+    wins, losses, total = 0, 0, 0
+    for t in trades:
+        action = t.get("action", "")
+        price = t.get("price", 0)
+        if action == "buy":
+            open_pos = price
+        elif action == "sell" and open_pos is not None:
+            pnl = price - open_pos
+            if pnl > 0:
+                wins += 1
+            elif pnl < 0:
+                losses += 1
+            total += 1
+            open_pos = None
+    return wins, losses, total
+
+
+def _mark_df_with_trades(df, trades: list):
+    """把 trades 按 date 对齐到 df.index，标出 buy/sell 在哪几行。"""
+    if df is None or len(df) == 0 or not trades:
+        return None
+    df = df.copy()
+    df["_trade_marker"] = None  # None / "buy" / "sell"
+    df["_trade_price"] = None
+    for t in trades:
+        date = t.get("date")
+        if hasattr(date, "strftime"):
+            date_str = date.strftime("%Y-%m-%d")
+        else:
+            date_str = str(date)[:10]
+        # 在 df 中找对应日期（取最近一根）
+        try:
+            import pandas as pd
+            target_ts = pd.Timestamp(date_str)
+            # 取 date_str 当天或之后的最近一行
+            mask = df.index >= target_ts
+            if mask.any():
+                idx = df.index[mask][0]
+                df.at[idx, "_trade_marker"] = t.get("action", "")
+                df.at[idx, "_trade_price"] = t.get("price", 0)
+        except Exception:
+            continue
+    return df
+
+
+def _build_kline_with_markers(df, trades: list, symbol: str, freq: str):
+    """构建带买卖点标记的 K 线图。"""
+    # 在 df.index 上筛选 buy/sell 行
+    buy_x, buy_y = [], []
+    sell_x, sell_y = [], []
+    for idx, row in df.iterrows():
+        marker = row.get("_trade_marker")
+        price = row.get("_trade_price")
+        if marker == "buy" and price is not None and not _is_nan(price):
+            buy_x.append(idx)
+            buy_y.append(price)
+        elif marker == "sell" and price is not None and not _is_nan(price):
+            sell_x.append(idx)
+            sell_y.append(price)
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="K线",
+        increasing_line_color="#d32f2f", decreasing_line_color="#388e3c",
+    ))
+    # 买: 绿色上箭头
+    if buy_x:
+        fig.add_trace(go.Scatter(
+            x=buy_x, y=buy_y, mode="markers+text",
+            marker=dict(symbol="triangle-up", size=14, color="#388e3c",
+                        line=dict(color="white", width=1)),
+            text=["B"] * len(buy_x), textposition="top center",
+            textfont=dict(color="white", size=9),
+            name="买入", hovertemplate="买入<br>日期: %{x}<br>价: %{y:.2f}<extra></extra>",
+        ))
+    # 卖: 红色下箭头
+    if sell_x:
+        fig.add_trace(go.Scatter(
+            x=sell_x, y=sell_y, mode="markers+text",
+            marker=dict(symbol="triangle-down", size=14, color="#d32f2f",
+                        line=dict(color="white", width=1)),
+            text=["S"] * len(sell_x), textposition="bottom center",
+            textfont=dict(color="white", size=9),
+            name="卖出", hovertemplate="卖出<br>日期: %{x}<br>价: %{y:.2f}<extra></extra>",
+        ))
+    fig.update_layout(
+        height=500,
+        title=f"{symbol} K线 + 买卖点 ({freq}, {len(trades)} 笔交易)",
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.02),
+    )
+    return fig
+
+
+def _is_nan(x) -> bool:
+    """判 None / NaN (不依赖 pandas)。"""
+    if x is None:
+        return True
+    if isinstance(x, float):
+        return x != x  # NaN check
+    return False
 
 
 def page_history():

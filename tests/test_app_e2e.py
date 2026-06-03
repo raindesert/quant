@@ -53,6 +53,13 @@ class _FakeCtx:
     def download_button(self, *a, **kw): pass
     def code(self, *a, **kw): pass
     def file_uploader(self, *a, **kw): return None
+    def radio(self, label, options, **kw): return options[0] if options else None
+    def data_editor(self, df, **kw): return df
+    def expander(self, *a, **kw):
+        class _E:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+        return _E()
 
 
 def _fake_slider(*a, **kw):
@@ -132,7 +139,14 @@ class FakeStreamlitRecorder:
     def number_input(self, *a, **kw): return 0
     def checkbox(self, *a, **kw): return a[1] if len(a) > 1 else False
     def json(self, *a, **kw): pass
-    def progress(self, *a, **kw): pass
+    def file_uploader(self, *a, **kw): return None
+    def radio(self, label, options, **kw): return options[0] if options else None
+    def data_editor(self, df, **kw): return df
+    def expander(self, *a, **kw):
+        class _E:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+        return _E()
     def spinner(self, *a, **kw):
         self.spinners_entered.append(a[0] if a else "")
         return _FakeCtx()
@@ -152,6 +166,8 @@ class FakeStreamlitRecorder:
     def caption(self, *a, **kw): pass
     def code(self, *a, **kw): pass
     def file_uploader(self, *a, **kw): return None
+    def radio(self, label, options, **kw): return options[0] if options else None
+    def data_editor(self, df, **kw): return df
     def expander(self, *a, **kw):
         class _E:
             def __enter__(self_): return self_
@@ -809,6 +825,106 @@ class TestIndicatorSection(unittest.TestCase):
             self.app._render_indicator_section(self._fake_df(60))
         finally:
             self.app.st.columns = original_columns
+
+
+class TestBuySellHelpers(unittest.TestCase):
+    """测试买卖点 helper 函数的纯逻辑部分。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = _install_fake_streamlit()
+        for mod in list(sys.modules.keys()):
+            if mod == "app" or mod.startswith("app."):
+                del sys.modules[mod]
+        import app  # noqa: F401
+        cls.app = app
+
+    def test_calc_trade_pnl_simple(self):
+        """3 笔交易: 1 盈 1 亏 1 平。"""
+        trades = [
+            {"date": "2026-01-15", "action": "buy", "price": 10.0},
+            {"date": "2026-02-01", "action": "sell", "price": 11.0},  # +1 盈
+            {"date": "2026-02-15", "action": "buy", "price": 12.0},
+            {"date": "2026-03-01", "action": "sell", "price": 11.5},  # -0.5 亏
+            {"date": "2026-03-15", "action": "buy", "price": 11.0},
+            {"date": "2026-04-01", "action": "sell", "price": 11.0},  # 平
+        ]
+        wins, losses, total = self.app._calc_trade_pnl(trades)
+        self.assertEqual((wins, losses, total), (1, 1, 3))
+
+    def test_calc_trade_pnl_no_sell(self):
+        """只买不卖: 0 total。"""
+        trades = [{"date": "2026-01-15", "action": "buy", "price": 10.0}]
+        self.assertEqual(self.app._calc_trade_pnl(trades), (0, 0, 0))
+
+    def test_calc_trade_pnl_empty(self):
+        """空列表。"""
+        self.assertEqual(self.app._calc_trade_pnl([]), (0, 0, 0))
+
+    def test_mark_df_with_trades(self):
+        """把 trades 对齐到 df.index 标记。"""
+        import pandas as pd
+        df = pd.DataFrame({
+            "open": [10, 11, 12, 13], "high": [10, 11, 12, 13],
+            "low": [10, 11, 12, 13], "close": [10, 11, 12, 13],
+            "volume": [1, 1, 1, 1],
+        }, index=pd.date_range("2026-01-01", periods=4, freq="D"))
+        trades = [
+            {"date": "2026-01-02", "action": "buy", "price": 11.0},
+            {"date": "2026-01-04", "action": "sell", "price": 13.0},
+        ]
+        marked = self.app._mark_df_with_trades(df, trades)
+        self.assertIsNotNone(marked)
+        self.assertEqual(marked.loc["2026-01-02", "_trade_marker"], "buy")
+        self.assertEqual(marked.loc["2026-01-04", "_trade_marker"], "sell")
+        # 1/3 无标记
+        self.assertIsNone(marked.loc["2026-01-01", "_trade_marker"])
+
+    def test_mark_df_no_trades(self):
+        """空 trades → 返 None。"""
+        import pandas as pd
+        df = pd.DataFrame({"open": [1], "close": [1]})
+        self.assertIsNone(self.app._mark_df_with_trades(df, []))
+
+    def test_build_kline_with_markers(self):
+        """构建带标记的 fig 不抛异常。"""
+        import pandas as pd
+        df = pd.DataFrame({
+            "open": [10, 11, 12, 13], "high": [10, 11, 12, 13],
+            "low": [10, 11, 12, 13], "close": [10, 11, 12, 13],
+            "volume": [1, 1, 1, 1],
+            "_trade_marker": [None, "buy", None, "sell"],
+            "_trade_price": [None, 11.0, None, 13.0],
+        }, index=pd.date_range("2026-01-01", periods=4, freq="D"))
+        trades = [
+            {"date": "2026-01-02", "action": "buy", "price": 11.0},
+            {"date": "2026-01-04", "action": "sell", "price": 13.0},
+        ]
+        fig = self.app._build_kline_with_markers(df, trades, "TEST", "day")
+        # fig 应该有 3 个 trace: K线 + 买 + 卖
+        self.assertEqual(len(fig.data), 3)
+
+    def test_build_kline_with_only_buy(self):
+        """只有买: 2 个 trace。"""
+        import pandas as pd
+        df = pd.DataFrame({
+            "open": [10, 11], "high": [10, 11], "low": [10, 11], "close": [10, 11],
+            "volume": [1, 1],
+            "_trade_marker": [None, "buy"],
+            "_trade_price": [None, 11.0],
+        }, index=pd.date_range("2026-01-01", periods=2, freq="D"))
+        fig = self.app._build_kline_with_markers(df, [{"date": "2026-01-02", "action": "buy", "price": 11.0}],
+                                                 "TEST", "day")
+        self.assertEqual(len(fig.data), 2)  # K + buy
+
+    def test_is_nan(self):
+        """_is_nan 工具。"""
+        from app import _is_nan
+        self.assertTrue(_is_nan(None))
+        self.assertTrue(_is_nan(float("nan")))
+        self.assertFalse(_is_nan(0))
+        self.assertFalse(_is_nan(0.0))
+        self.assertFalse(_is_nan(""))
 
 
 class TestAppRouter(unittest.TestCase):
