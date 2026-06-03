@@ -39,6 +39,11 @@ from utils.watchlist import (
     get_enabled_symbols as _wl_enabled,
     DEFAULT_PATH as _WATCHLIST_PATH,
 )
+from utils.risk import (
+    value_at_risk, conditional_var, max_drawdown,
+    max_consecutive_losses, rolling_sharpe, rolling_volatility,
+    monte_carlo_simulation, summary_risk_metrics,
+)
 
 
 def load_config():
@@ -59,10 +64,11 @@ PAGE_WALK_FORWARD = "🔄 Walk-Forward"
 PAGE_REALTIME = "📡 实时行情"
 PAGE_HISTORY = "🗂️ 回测历史"
 PAGE_WATCHLIST = "⭐ 自选股票"
+PAGE_RISK = "📉 风险分析"
 
 ALL_PAGES = [
     PAGE_BACKTEST, PAGE_COMPARISON, PAGE_OPTIMIZE, PAGE_MULTI_STRATEGY,
-    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME, PAGE_HISTORY, PAGE_WATCHLIST,
+    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME, PAGE_HISTORY, PAGE_WATCHLIST, PAGE_RISK,
 ]
 
 
@@ -2130,6 +2136,281 @@ def _is_nan(x) -> bool:
     return False
 
 
+def page_risk_metrics():
+    """风险分析 - 从历史回测 equity_curve 算 VaR/CVaR/最大回撤/连续亏损/蒙特卡洛。
+
+    4 块:
+    1. 选数据源 (历史记录里的某条 / 上传 equity CSV)
+    2. 4 风险指标卡 (VaR 95/99 + CVaR 95/99 + 最大回撤 + 连续亏损)
+    3. 回撤曲线图 + 收益分布直方图 + 滚动夏普
+    4. 蒙特卡洛模拟 (N 条路径 + 置信带)
+    """
+    import pandas as pd
+    st.header("📉 风险分析")
+    st.caption("从历史回测的 equity_curve 计算 VaR / CVaR / 最大回撤 / 连续亏损")
+
+    history = st.session_state.get(HISTORY_KEY, [])
+
+    # 1. 数据源选择
+    st.subheader("1️⃣ 数据源")
+    if not history:
+        st.info("📭 暂无回测历史。先到 📊 单策略回测或 🔀 多策略组合跑一次。")
+        return
+
+    # 列出所有有 equity_curve 的历史记录
+    candidates = [
+        (i, h) for i, h in enumerate(history)
+        if h.get("equity_curve") and len(h["equity_curve"]) > 1
+    ]
+    if not candidates:
+        st.warning("历史记录里没有 equity_curve 字段。请用带 summary 的回测结果。")
+        return
+
+    options_labels = [
+        f"#{i} — {h.get('symbol', '?')} {h.get('strategy', '?').upper()} "
+        f"({h.get('profit_pct', 0):+.2f}%)"
+        for i, h in candidates
+    ]
+    sel_idx = st.selectbox(
+        "选历史记录", range(len(candidates)),
+        format_func=lambda i: options_labels[i],
+        key="risk_history_sel",
+    )
+    rec = candidates[sel_idx][1]
+    equity = rec["equity_curve"]
+
+    # 2. 风险指标卡
+    st.subheader("2️⃣ 核心风险指标")
+    var95 = value_at_risk(equity, 0.95)
+    var99 = value_at_risk(equity, 0.99)
+    cvar95 = conditional_var(equity, 0.95)
+    cvar99 = conditional_var(equity, 0.99)
+    mdd = max_drawdown(equity)
+    mcl = max_consecutive_losses(equity)
+
+    cols = st.columns(6)
+    cols[0].metric("VaR 95%", f"{var95 * 100:.2f}%", help="95% 置信度下最大单日损失",
+                    delta=f"损失" if var95 > 0 else None, delta_color="inverse")
+    cols[1].metric("VaR 99%", f"{var99 * 100:.2f}%", help="99% 置信度下最大单日损失",
+                    delta="损失", delta_color="inverse")
+    cols[2].metric("CVaR 95%", f"{cvar95 * 100:.2f}%",
+                    help="VaR 之外最差 5% 的平均损失（更严格）", delta_color="inverse")
+    cols[3].metric("CVaR 99%", f"{cvar99 * 100:.2f}%",
+                    help="VaR 之外最差 1% 的平均损失", delta_color="inverse")
+    cols[4].metric("最大回撤", mdd["max_drawdown_pct"],
+                    help=f"从 peak{trough_to_text(mdd['peak_idx'])}到 trough{trough_to_text(mdd['trough_idx'])}",
+                    delta_color="inverse")
+    cols[5].metric("最大连续亏损", f"{mcl['max_count']} 天",
+                    help=f"累计 {mcl['max_loss_pct']}")
+
+    st.caption(
+        f"📍 回撤期: peak {mdd['drawdown_duration']} 天 → "
+        f"recovery: {mdd['recovery_duration'] if mdd['recovery_duration'] is not None else '❌ 未恢复'} 天"
+    )
+
+    # 3. 图表：回撤曲线 + 收益分布 + 滚动夏普
+    st.subheader("3️⃣ 风险可视化")
+    _render_risk_charts(equity, rec)
+
+    # 4. 蒙特卡洛
+    st.subheader("4️⃣ 蒙特卡洛模拟")
+    _render_monte_carlo(equity)
+
+
+def trough_to_text(idx: int) -> str:
+    """trough 索引转成 #N 文字。"""
+    return f"#{idx}" if idx >= 0 else "?"
+
+
+def _render_risk_charts(equity, rec):
+    """画回撤曲线 + 收益分布 + 滚动夏普 3 张图。"""
+    import pandas as pd
+    if isinstance(equity[0], dict):
+        values = [e["value"] for e in equity]
+    else:
+        values = list(equity)
+
+    # 1. 权益曲线 + 回撤 (双面板)
+    peak = values[0]
+    drawdowns = []
+    for v in values:
+        if v > peak:
+            peak = v
+        dd = (v - peak) / peak if peak > 0 else 0
+        drawdowns.append(dd)
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.6, 0.4], vertical_spacing=0.05,
+    )
+    fig.add_trace(go.Scatter(
+        x=list(range(len(values))), y=values, name="权益",
+        line=dict(color="#29B6F6", width=1.5),
+        fill="tozeroy", fillcolor="rgba(41, 182, 246, 0.1)",
+    ), row=1, col=1)
+    # 回撤用 area 染红
+    fig.add_trace(go.Scatter(
+        x=list(range(len(values))), y=[d * 100 for d in drawdowns], name="回撤%",
+        line=dict(color="#d32f2f", width=1.2),
+        fill="tozeroy", fillcolor="rgba(211, 47, 47, 0.2)",
+    ), row=2, col=1)
+    fig.update_layout(
+        height=450,
+        title=f"权益曲线 & 回撤 (峰值 {max(values):,.0f})",
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="权益", row=1, col=1)
+    fig.update_yaxes(title_text="回撤 %", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 2. 收益分布直方图 + 正态叠加
+    rets = [(values[i] - values[i - 1]) / values[i - 1]
+            for i in range(1, len(values)) if values[i - 1] > 0]
+    if rets:
+        import statistics
+        mu = statistics.mean(rets)
+        sigma = statistics.stdev(rets) if len(rets) > 1 else 0
+        fig2 = go.Figure()
+        fig2.add_trace(go.Histogram(
+            x=[r * 100 for r in rets], name="收益分布",
+            nbinsx=30, marker_color="#66BB6A", opacity=0.7,
+        ))
+        # 正态叠加
+        if sigma > 0:
+            import numpy as np
+            x = np.linspace(mu * 100 - 4 * sigma * 100, mu * 100 + 4 * sigma * 100, 100)
+            from math import exp, sqrt, pi
+            y_norm = [exp(-((xi / 100 - mu) ** 2) / (2 * sigma ** 2)) /
+                      (sigma * sqrt(2 * pi)) * len(rets) *
+                      (max(rets) - min(rets)) / 30
+                      for xi in x]
+            fig2.add_trace(go.Scatter(
+                x=x, y=y_norm, name="正态拟合",
+                line=dict(color="#d32f2f", width=2, dash="dash"),
+            ))
+        fig2.update_layout(
+            title=f"日收益分布 (μ={mu * 100:.3f}%, σ={sigma * 100:.2f}%)",
+            xaxis_title="日收益 %", yaxis_title="频次",
+            height=350,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # 3. 滚动夏普 + 滚动波动
+    if len(values) > 20:
+        col1, col2 = st.columns(2)
+        sharpe = rolling_sharpe(equity, window=20)
+        vol = rolling_volatility(equity, window=20)
+        with col1:
+            fig3 = go.Figure()
+            fig3.add_trace(go.Scatter(
+                x=list(range(len(sharpe))), y=sharpe, name="滚动夏普(20)",
+                line=dict(color="#FFA726", width=1.5),
+            ))
+            fig3.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig3.update_layout(
+                title="滚动夏普 (20天, 年化)",
+                height=300, hovermode="x unified",
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+        with col2:
+            fig4 = go.Figure()
+            fig4.add_trace(go.Scatter(
+                x=list(range(len(vol))), y=vol, name="滚动波动率(20)",
+                line=dict(color="#AB47BC", width=1.5),
+                fill="tozeroy", fillcolor="rgba(171, 71, 188, 0.1)",
+            ))
+            fig4.update_layout(
+                title="滚动波动率 (20天, 年化 %)",
+                height=300, hovermode="x unified",
+            )
+            st.plotly_chart(fig4, use_container_width=True)
+
+
+def _render_monte_carlo(equity):
+    """蒙特卡洛模拟 + 置信带图。"""
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        n_sims = st.number_input("模拟次数", 100, 5000, 1000, 100, key="mc_n")
+    with col2:
+        n_days = st.number_input("预测天数", 30, 500, 252, 30, key="mc_d")
+    with col3:
+        seed = st.number_input("随机种子", 0, 99999, 42, 1, key="mc_seed")
+
+    if st.button("🎲 运行模拟", key="mc_run", use_container_width=True, type="primary"):
+        with st.spinner(f"生成 {n_sims} 条 {n_days} 天路径..."):
+            paths = monte_carlo_simulation(equity, n_sims=n_sims, n_days=n_days, seed=seed)
+        if not paths:
+            st.error("equity_curve 数据不足")
+            return
+        st.session_state["mc_paths"] = paths
+        st.success(f"生成 {len(paths)} 条路径")
+
+    paths = st.session_state.get("mc_paths")
+    if not paths:
+        st.caption("点上面按钮开始模拟")
+        return
+
+    # 5/50/95 分位 + 中位数 + 全部
+    import numpy as np
+    arr = np.array(paths)  # (n_sims, n_days+1)
+    p5 = np.percentile(arr, 5, axis=0)
+    p50 = np.percentile(arr, 50, axis=0)
+    p95 = np.percentile(arr, 95, axis=0)
+    mean = np.mean(arr, axis=0)
+
+    fig = go.Figure()
+    # 5%-95% 置信带
+    fig.add_trace(go.Scatter(
+        x=list(range(len(p5))), y=p95, name="95% 分位",
+        line=dict(color="rgba(0,0,0,0)"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=list(range(len(p5))), y=p5, name="5% 分位",
+        line=dict(color="rgba(0,0,0,0)"),
+        fill="tonexty", fillcolor="rgba(102, 187, 90, 0.2)",
+    ))
+    # 中位数
+    fig.add_trace(go.Scatter(
+        x=list(range(len(p50))), y=p50, name="中位数",
+        line=dict(color="#388e3c", width=2),
+    ))
+    # 均值
+    fig.add_trace(go.Scatter(
+        x=list(range(len(mean))), y=mean, name="均值",
+        line=dict(color="#FFA726", width=1.5, dash="dash"),
+    ))
+    # 抽 50 条随机路径
+    import random
+    rng = random.Random(42)
+    sample = rng.sample(range(len(paths)), min(50, len(paths)))
+    for i in sample:
+        fig.add_trace(go.Scatter(
+            x=list(range(len(paths[i]))), y=paths[i],
+            mode="lines", showlegend=False,
+            line=dict(color="rgba(171, 71, 188, 0.1)", width=0.5),
+        ))
+    fig.update_layout(
+        title=f"蒙特卡洛 {n_sims} 次模拟 × {n_days} 天",
+        xaxis_title="天数", yaxis_title="权益",
+        height=500, hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 终值分布
+    final_values = arr[:, -1]
+    last_real = paths[0][0] if paths else 0
+    final_p5, final_p50, final_p95 = np.percentile(final_values, [5, 50, 95])
+    cols = st.columns(4)
+    cols[0].metric("起始权益", f"{last_real:,.0f}")
+    cols[1].metric("终值中位数", f"{final_p50:,.0f}",
+                   delta=f"{(final_p50 / last_real - 1) * 100:+.2f}%" if last_real > 0 else None)
+    cols[2].metric("5% 最差情况", f"{final_p5:,.0f}",
+                   delta=f"{(final_p5 / last_real - 1) * 100:+.2f}%" if last_real > 0 else None,
+                   delta_color="inverse")
+    cols[3].metric("5% 最好情况", f"{final_p95:,.0f}",
+                   delta=f"{(final_p95 / last_real - 1) * 100:+.2f}%" if last_real > 0 else None)
+
+
 def page_history():
     """回测历史 — 表格/趋势图/加载/导出。"""
     st.header("🗂️ 回测历史")
@@ -2647,6 +2928,7 @@ _PAGE_ROUTER = {
     PAGE_REALTIME: page_realtime,
     PAGE_HISTORY: page_history,
     PAGE_WATCHLIST: page_watchlist,
+    PAGE_RISK: page_risk_metrics,
 }
 
 

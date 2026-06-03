@@ -345,6 +345,31 @@ class TestAppPages(unittest.TestCase):
                 if real_path.exists():
                     real_path.unlink()
 
+    def test_page_risk_empty(self):
+        """空历史 → page_risk_metrics 走 early return。"""
+        self.rec.session_state[self.app.HISTORY_KEY] = []
+        self._run_page(self.app.PAGE_RISK)
+        self.assertIn("风险分析", self.rec.headers[0])
+
+    def test_page_risk_no_equity(self):
+        """历史有记录但没 equity_curve → warning。"""
+        self.rec.session_state[self.app.HISTORY_KEY] = [
+            {"symbol": "X", "strategy": "sma", "profit_pct": 1.0}  # 缺 equity_curve
+        ]
+        self._run_page(self.app.PAGE_RISK)
+        self.assertIn("风险分析", self.rec.headers[0])
+
+    def test_page_risk_with_equity(self):
+        """正常历史 → 完整跑通。"""
+        ec = [{"date": f"2026-01-{i+1:02d}", "value": 1_000_000 + i * 1000}
+              for i in range(60)]
+        self.rec.session_state[self.app.HISTORY_KEY] = [{
+            "symbol": "000001.SZ", "strategy": "sma",
+            "profit_pct": 5.0, "equity_curve": ec,
+        }]
+        self._run_page(self.app.PAGE_RISK)
+        self.assertIn("风险分析", self.rec.headers[0])
+
 
 class TestHistoryManager(unittest.TestCase):
     """测试 _history_add / _history_remove / _history_clear 的纯逻辑（不调 st UI）。"""
@@ -1040,12 +1065,12 @@ class TestAppRouter(unittest.TestCase):
         cls.app = app
 
     def test_router_has_all_pages(self):
-        self.assertEqual(len(self.app._PAGE_ROUTER), 9)
+        self.assertEqual(len(self.app._PAGE_ROUTER), 10)
         for page in [
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
             self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
-            self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST,
+            self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST, self.app.PAGE_RISK,
         ]:
             self.assertIn(page, self.app._PAGE_ROUTER)
             self.assertTrue(callable(self.app._PAGE_ROUTER[page]))
@@ -1060,9 +1085,121 @@ class TestAppRouter(unittest.TestCase):
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
             self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
-            self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST,
+            self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST, self.app.PAGE_RISK,
         ]
         self.assertEqual(len(consts), len(set(consts)))
+
+
+class TestRiskMetrics(unittest.TestCase):
+    """utils.risk 纯函数测试。"""
+
+    def test_value_at_risk_historical(self):
+        from utils.risk import value_at_risk
+        # 简单 equity: 大部分小波动，1 个大亏损
+        equity = [100, 101, 100, 99, 102, 80, 95, 100, 99, 100, 100]
+        var = value_at_risk(equity, 0.95)
+        self.assertGreater(var, 0)  # 损失
+        self.assertGreater(var, 0.1)  # 大亏损 > 10%
+
+    def test_value_at_risk_parametric(self):
+        from utils.risk import value_at_risk
+        equity = [100 + i for i in range(50)]  # 稳定上升
+        var = value_at_risk(equity, 0.95, method="parametric")
+        # 0 收益 → VaR ≈ 0
+        self.assertAlmostEqual(var, 0, delta=0.01)
+
+    def test_conditional_var(self):
+        from utils.risk import conditional_var
+        equity = [100, 101, 100, 99, 102, 80, 95, 100, 99, 100, 100]
+        cvar = conditional_var(equity, 0.95)
+        self.assertGreater(cvar, 0)
+        # CVaR >= VaR (更严格)
+        from utils.risk import value_at_risk
+        var = value_at_risk(equity, 0.95)
+        self.assertGreaterEqual(cvar, var)
+
+    def test_max_drawdown_simple(self):
+        from utils.risk import max_drawdown
+        equity = [100, 110, 120, 100, 80, 95, 105, 100]
+        mdd = max_drawdown(equity)
+        self.assertEqual(mdd["peak_idx"], 2)  # 120
+        self.assertEqual(mdd["trough_idx"], 4)  # 80
+        # 80/120 = 0.6667, mdd = 0.6667 - 1 = -0.3333
+        self.assertAlmostEqual(mdd["max_drawdown"], 80/120 - 1, places=4)
+        # 后续 95/105/100 都 < 120, 未恢复
+        self.assertIsNone(mdd["recovery_idx"])
+
+    def test_max_drawdown_recovered(self):
+        from utils.risk import max_drawdown
+        equity = [100, 110, 120, 80, 100, 130]
+        mdd = max_drawdown(equity)
+        self.assertEqual(mdd["peak_idx"], 2)
+        self.assertEqual(mdd["trough_idx"], 3)
+        # 130 > 120 → 恢复
+        self.assertEqual(mdd["recovery_idx"], 5)
+        self.assertEqual(mdd["drawdown_duration"], 1)
+        self.assertEqual(mdd["recovery_duration"], 2)
+
+    def test_max_drawdown_dict_input(self):
+        from utils.risk import max_drawdown
+        ec = [{"value": v} for v in [100, 110, 120, 80, 100, 130]]
+        mdd = max_drawdown(ec)
+        self.assertEqual(mdd["peak_idx"], 2)
+
+    def test_max_consecutive_losses(self):
+        from utils.risk import max_consecutive_losses
+        # 5 连亏: 100→99→98→97→96→95, 损失累计
+        # (99-100)/100 + (98-99)/99 + (97-98)/98 + (96-97)/97 + (95-96)/96
+        equity = [100, 99, 98, 97, 96, 95, 96, 94, 93, 92, 93]
+        mcl = max_consecutive_losses(equity)
+        self.assertEqual(mcl["max_count"], 5)
+        # 不精确校验 sum，只校验是负数且 < -0.04
+        self.assertLess(mcl["max_loss_sum"], -0.04)
+        self.assertGreater(mcl["max_loss_sum"], -0.06)
+
+    def test_rolling_sharpe(self):
+        from utils.risk import rolling_sharpe
+        equity = [100 + i for i in range(50)]  # 稳定上升
+        s = rolling_sharpe(equity, window=10)
+        self.assertEqual(len(s), 49)
+        # 全部为正（持续上升）
+        self.assertTrue(all(x >= 0 for x in s))
+
+    def test_rolling_volatility(self):
+        from utils.risk import rolling_volatility
+        equity = [100 + (i % 5) for i in range(30)]  # 振荡
+        v = rolling_volatility(equity, window=10)
+        self.assertEqual(len(v), 29)
+        # 至少有一个 > 0（除了前 9 个）
+        self.assertTrue(any(x > 0 for x in v[10:]))
+
+    def test_monte_carlo_basic(self):
+        from utils.risk import monte_carlo_simulation
+        equity = [100 + i * 0.5 for i in range(50)]
+        paths = monte_carlo_simulation(equity, n_sims=10, n_days=30, seed=42)
+        self.assertEqual(len(paths), 10)
+        self.assertEqual(len(paths[0]), 31)
+        # 所有路径起始点 = 最后值
+        last = 100 + 49 * 0.5
+        for p in paths:
+            self.assertAlmostEqual(p[0], last, places=1)
+
+    def test_monte_carlo_short_data(self):
+        from utils.risk import monte_carlo_simulation
+        # 数据不足
+        self.assertEqual(monte_carlo_simulation([100], n_sims=10), [])
+        self.assertEqual(monte_carlo_simulation([], n_sims=10), [])
+
+    def test_summary_risk_metrics(self):
+        from utils.risk import summary_risk_metrics
+        equity = [100, 101, 99, 102, 98, 103, 100, 105, 95, 110]
+        s = summary_risk_metrics(equity)
+        self.assertIn("VaR 95%", s)
+        self.assertIn("VaR 99%", s)
+        self.assertIn("CVaR 95%", s)
+        self.assertIn("CVaR 99%", s)
+        self.assertIn("最大回撤", s)
+        self.assertIn("最大连续亏损", s)
 
 
 if __name__ == "__main__":
