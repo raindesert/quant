@@ -44,3 +44,8 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# 运行时产物（不应入库）
+presets/*.yaml
+params/*.json
+reports/

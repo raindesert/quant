@@ -121,7 +121,11 @@ class DataFetcher:
 
         tx_symbol = self._to_tencent_symbol(symbol)
         try:
-            df = self._fetch_from_tencent(tx_symbol, days, frequency=frequency)
+            if frequency == "day":
+                df = self._fetch_from_tencent(tx_symbol, days, frequency=frequency)
+            else:
+                # 分钟线走专用 endpoint
+                df = self._fetch_from_tencent_minute(tx_symbol, freq=frequency)
             if not df.empty:
                 with self._cache_lock:
                     self._history_cache[cache_key] = (df.copy(), now)
@@ -253,6 +257,73 @@ class DataFetcher:
         code_part, exchange = parts
         alt_exchange = "SH" if exchange.upper() == "SZ" else "SZ"
         return f"{code_part}.{alt_exchange}"
+
+    def _fetch_from_tencent_minute(self, symbol: str, freq: str = "m5") -> pd.DataFrame:
+        """从腾讯 minute endpoint 拉分钟数据（仅当天，复权不可用）。
+
+        Args:
+            symbol: 腾讯格式代码（sz000001）
+            freq: 'm1' / 'm5' / 'm15' / 'm30' / 'm60'
+                注意：腾讯 minute/query 只能拉当天数据，要历史分钟线
+                需要别的数据源（如 baostock 分钟接口、东方财富）。
+        """
+        try:
+            response = self.session.get(
+                f"https://web.ifzq.gtimg.cn/appstock/app/minute/query",
+                params={"code": symbol},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data_map = payload.get("data") or {}
+            if not data_map:
+                return pd.DataFrame()
+            code = next(iter(data_map))
+            code_payload = data_map.get(code) or {}
+            data = code_payload.get("data") or {}
+            rows = data.get("data") or []
+            if not rows:
+                return pd.DataFrame()
+
+            # 格式: "HHMM price volume amount" → 按 freq 聚合
+            records = []
+            today = datetime.now().strftime("%Y-%m-%d")
+            for row in rows:
+                parts = row.split()
+                if len(parts) < 4:
+                    continue
+                time_str, price, volume, amount = parts[0], parts[1], parts[2], parts[3]
+                # 把 HHMM 转成今天的具体时间
+                hh, mm = int(time_str[:2]), int(time_str[2:4])
+                records.append({
+                    "datetime_str": f"{today} {time_str[:2]}:{time_str[2:4]}",
+                    "price": float(price),
+                    "volume": float(volume),
+                    "amount": float(amount),
+                })
+            if not records:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(records)
+            df["date"] = pd.to_datetime(df["datetime_str"])
+            df = df.drop(columns=["datetime_str"])
+            df = df.set_index("date")
+
+            # 按 freq 聚合
+            freq_map = {"m1": "1min", "m5": "5min", "m15": "15min", "m30": "30min", "m60": "1h"}
+            pandas_freq = freq_map.get(freq, "5min")
+            agg = df.resample(pandas_freq).agg({
+                "price": ["first", "last", "max", "min"],
+                "volume": "sum",
+                "amount": "sum",
+            })
+            agg.columns = ["open", "close", "high", "low", "volume", "amount"]
+            agg = agg.dropna().reset_index()
+            agg = agg.rename(columns={"date": "date"})
+            agg["turnover"] = 0.0
+            return agg[["date", "open", "close", "high", "low", "volume", "amount", "turnover"]]
+        except Exception as exc:
+            raise RuntimeError(f"腾讯分钟 API 失败: {exc}") from exc
 
     def _fetch_from_tencent(self, symbol: str, days: int, frequency: str = "day") -> pd.DataFrame:
         """从腾讯 API 拉数据。
