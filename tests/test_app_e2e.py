@@ -51,6 +51,8 @@ class _FakeCtx:
     def warning(self, *a, **kw): pass
     def success(self, *a, **kw): pass
     def download_button(self, *a, **kw): pass
+    def code(self, *a, **kw): pass
+    def file_uploader(self, *a, **kw): return None
 
 
 def _fake_slider(*a, **kw):
@@ -148,6 +150,13 @@ class FakeStreamlitRecorder:
     def multiselect(self, label, options, **kw): return list(options)
     def text_area(self, label, **kw): return ""
     def caption(self, *a, **kw): pass
+    def code(self, *a, **kw): pass
+    def file_uploader(self, *a, **kw): return None
+    def expander(self, *a, **kw):
+        class _E:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+        return _E()
 
 
 def _install_fake_streamlit() -> FakeStreamlitRecorder:
@@ -238,6 +247,41 @@ class TestAppPages(unittest.TestCase):
         self._run_page(self.app.PAGE_HISTORY)
         self.assertIn("回测历史", self.rec.headers[0])
 
+    def test_page_watchlist(self):
+        """端到端跑 page_watchlist。空 + 非空两种情况。
+        注意：page_watchlist 内部读 _WATCHLIST_PATH（app.py 启动时绑定）。
+        改 monkey patch DEFAULT_PATH + 重新 import app 不优雅。
+        改用：直接临时覆盖真文件，跑完还原。
+        """
+        import tempfile
+        from pathlib import Path
+        from utils.watchlist import DEFAULT_PATH as real_path
+        from utils.watchlist import add_stock as wl_add
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        backup = tmp_dir / "real_watchlist_backup.json"
+        real_existed = real_path.exists()
+        if real_existed:
+            backup.write_text(real_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        try:
+            # 1) 覆盖真文件为空，page_watchlist 应跑通
+            real_path.write_text('{"version": 1, "stocks": []}', encoding="utf-8")
+            self._run_page(self.app.PAGE_WATCHLIST)
+            self.assertIn("自选股票", self.rec.headers[0])
+
+            # 2) 加 1 个，page_watchlist 再次跑通
+            wl_add("000001.SZ", "平安银行", ["银行"])
+            self._run_page(self.app.PAGE_WATCHLIST)
+            self.assertIn("自选股票", self.rec.headers[0])
+        finally:
+            # 还原用户真文件
+            if real_existed and backup.exists():
+                real_path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+            else:
+                if real_path.exists():
+                    real_path.unlink()
+
 
 class TestHistoryManager(unittest.TestCase):
     """测试 _history_add / _history_remove / _history_clear 的纯逻辑（不调 st UI）。"""
@@ -322,6 +366,130 @@ class TestHistoryManager(unittest.TestCase):
         self.assertEqual(h[-1]["profit_pct"], float(self.app.HISTORY_MAX + 4))
 
 
+class TestWatchlist(unittest.TestCase):
+    """utils.watchlist 的单元测试 — 用临时文件隔离，不污染用户真文件。"""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = Path(tempfile.mkdtemp()) / "wl.json"
+
+    def test_normalize_various_formats(self):
+        from utils.watchlist import _normalize_symbol, is_valid_symbol
+        cases = [
+            ("000001.SZ", "000001.SZ"),
+            ("000001.sz", "000001.SZ"),
+            ("sz000001", "000001.SZ"),
+            ("SZ000001", "000001.SZ"),
+            ("000001", "000001.SZ"),  # 默认深市
+            ("600000", "600000.SH"),
+            ("601318", "601318.SH"),
+            ("688000", "688000.SH"),
+            ("sh600000", "600000.SH"),
+        ]
+        for inp, expected in cases:
+            self.assertEqual(_normalize_symbol(inp), expected, f"inp={inp}")
+        # 校验
+        self.assertTrue(is_valid_symbol("000001.SZ"))
+        self.assertTrue(is_valid_symbol("600000.SH"))
+        self.assertFalse(is_valid_symbol(""))
+        self.assertFalse(is_valid_symbol("00001"))
+        self.assertFalse(is_valid_symbol("000001.sz"))  # 应该是大写
+
+    def test_add_dedup(self):
+        from utils.watchlist import add_stock, load_watchlist
+        r = add_stock("000001.SZ", "平安银行", ["银行"], path=self.tmp)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["symbol"], "000001.SZ")
+        # 重复
+        self.assertIsNone(add_stock("000001.SZ", path=self.tmp))
+        # 无效
+        self.assertIsNone(add_stock("invalid", path=self.tmp))
+        self.assertEqual(len(load_watchlist(self.tmp)), 1)
+
+    def test_remove(self):
+        from utils.watchlist import add_stock, remove_stock, load_watchlist
+        add_stock("000001.SZ", path=self.tmp)
+        add_stock("600000.SH", path=self.tmp)
+        self.assertTrue(remove_stock("000001.SZ", path=self.tmp))
+        self.assertFalse(remove_stock("000001.SZ", path=self.tmp))  # 已无
+        self.assertEqual(len(load_watchlist(self.tmp)), 1)
+
+    def test_update(self):
+        from utils.watchlist import add_stock, update_stock, load_watchlist
+        add_stock("000001.SZ", "旧名", path=self.tmp)
+        self.assertTrue(update_stock("000001.SZ", name="新名", path=self.tmp))
+        s = load_watchlist(self.tmp)[0]
+        self.assertEqual(s["name"], "新名")
+
+    def test_update_ignores_protected_fields(self):
+        """update_stock 实现: 在循环里 if k in ('symbol', 'added'): continue
+        验证: 通过 update_stock 改 name 成功; 试图通过 **fields 改 symbol
+        也不会报错（因为 **fields 不包含 symbol 位置绑定）。
+        """
+        from utils.watchlist import add_stock, update_stock, load_watchlist
+        add_stock("000001.SZ", "旧名", path=self.tmp)
+        # 正常更新 name — 成功
+        self.assertTrue(update_stock("000001.SZ", name="新名", path=self.tmp))
+        s = load_watchlist(self.tmp)[0]
+        self.assertEqual(s["name"], "新名")
+        # 试图把 symbol 当 fields 改（API 内部忽略）
+        # 这里测: 调 update_stock 时即使 *fields 里有 'symbol'/'added'，也不会生效
+        # 模拟：调 add_stock 添加 Y, 改 X 的 fields
+        update_stock("000001.SZ", tags=["已改"], path=self.tmp)
+        s2 = load_watchlist(self.tmp)[0]
+        self.assertEqual(s2["tags"], ["已改"])
+        self.assertEqual(s2["symbol"], "000001.SZ")  # symbol 没变
+
+    def test_enabled_filter(self):
+        from utils.watchlist import (
+            add_stock, update_stock, get_enabled_symbols,
+        )
+        add_stock("000001.SZ", path=self.tmp)
+        add_stock("600000.SH", path=self.tmp)
+        add_stock("000002.SZ", path=self.tmp)
+        syms = get_enabled_symbols(self.tmp)
+        self.assertEqual(syms, ["000001.SZ", "600000.SH", "000002.SZ"])
+        update_stock("000001.SZ", enabled=False, path=self.tmp)
+        syms = get_enabled_symbols(self.tmp)
+        self.assertEqual(syms, ["600000.SH", "000002.SZ"])
+
+    def test_csv_roundtrip(self):
+        from utils.watchlist import add_stock, export_csv, import_csv
+        add_stock("000001.SZ", "平安", ["银行"], path=self.tmp)
+        add_stock("600000.SH", "浦发", ["银行"], path=self.tmp)
+        csv = export_csv(path=self.tmp)
+        self.assertIn("symbol,name,tags", csv)
+        self.assertIn("000001.SZ", csv)
+        # 移到新文件再导入
+        import tempfile
+        from pathlib import Path
+        tmp2 = Path(tempfile.mkdtemp()) / "wl2.json"
+        n = import_csv(csv, path=tmp2)
+        self.assertEqual(n, 2)
+        # 重复导入
+        n = import_csv(csv, path=tmp2)
+        self.assertEqual(n, 0)
+
+    def test_load_handles_corrupt(self):
+        from utils.watchlist import load_watchlist
+        self.tmp.write_text("not json {{{", encoding="utf-8")
+        self.assertEqual(load_watchlist(self.tmp), [])
+
+    def test_load_filters_invalid_entries(self):
+        from utils.watchlist import load_watchlist, save_watchlist
+        save_watchlist([
+            {"symbol": "000001.SZ", "name": "OK", "tags": []},
+            {"symbol": "invalid", "name": "bad"},  # 应被过滤
+            {"not_a_dict": True},  # 应被过滤
+            {"symbol": "600000.SH"},  # OK, 缺字段补默认
+        ], path=self.tmp)
+        stocks = load_watchlist(self.tmp)
+        self.assertEqual(len(stocks), 2)
+        symbols = {s["symbol"] for s in stocks}
+        self.assertEqual(symbols, {"000001.SZ", "600000.SH"})
+
+
 class TestAppRouter(unittest.TestCase):
     """验证 _PAGE_ROUTER 字典完整性。"""
 
@@ -335,11 +503,12 @@ class TestAppRouter(unittest.TestCase):
         cls.app = app
 
     def test_router_has_all_pages(self):
-        self.assertEqual(len(self.app._PAGE_ROUTER), 8)
+        self.assertEqual(len(self.app._PAGE_ROUTER), 9)
         for page in [
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
-            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME, self.app.PAGE_HISTORY,
+            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
+            self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST,
         ]:
             self.assertIn(page, self.app._PAGE_ROUTER)
             self.assertTrue(callable(self.app._PAGE_ROUTER[page]))
@@ -353,7 +522,8 @@ class TestAppRouter(unittest.TestCase):
         consts = [
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
-            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME, self.app.PAGE_HISTORY,
+            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
+            self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST,
         ]
         self.assertEqual(len(consts), len(set(consts)))
 

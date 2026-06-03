@@ -33,6 +33,12 @@ from config.loader import load_config as load_user_config, merge_config_with_arg
 from data.fetcher import DataFetcher
 from data.processor import DataProcessor
 from risk.manager import RiskManager
+from utils.watchlist import (
+    load_watchlist as _wl_load,
+    add_stock as _wl_add,
+    get_enabled_symbols as _wl_enabled,
+    DEFAULT_PATH as _WATCHLIST_PATH,
+)
 
 
 def load_config():
@@ -52,10 +58,11 @@ PAGE_YAML = "📁 YAML 预设"
 PAGE_WALK_FORWARD = "🔄 Walk-Forward"
 PAGE_REALTIME = "📡 实时行情"
 PAGE_HISTORY = "🗂️ 回测历史"
+PAGE_WATCHLIST = "⭐ 自选股票"
 
 ALL_PAGES = [
     PAGE_BACKTEST, PAGE_COMPARISON, PAGE_OPTIMIZE, PAGE_MULTI_STRATEGY,
-    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME, PAGE_HISTORY,
+    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME, PAGE_HISTORY, PAGE_WATCHLIST,
 ]
 
 
@@ -96,19 +103,82 @@ def render_sidebar() -> str:
 
         st.markdown("---")
         st.markdown("### 全局参数")
-        # 共享参数（所有 page 都能访问）
+
+        # 自选股票下拉 + 手动输入
+        watchlist = _wl_load()
+        enabled_syms = _wl_enabled()
+        # 始终包含当前 session 的 global_symbol（如果没在自选里）
         st.session_state.setdefault("global_symbol", CONFIG.get("default_symbol", "000001.SZ"))
-        st.session_state["global_symbol"] = st.text_input(
-            "默认股票代码", value=st.session_state["global_symbol"],
-            help="各页面默认使用此代码",
+        if st.session_state["global_symbol"] not in enabled_syms:
+            enabled_syms = [st.session_state["global_symbol"]] + enabled_syms
+
+        if enabled_syms:
+            current_idx = enabled_syms.index(
+                st.session_state["global_symbol"]
+            ) if st.session_state["global_symbol"] in enabled_syms else 0
+            chosen = st.selectbox(
+                "自选股票",
+                options=enabled_syms,
+                index=current_idx,
+                help="自选股票列表来自 ~/.quant_watchlist.json，可到 ⭐ 自选股票页管理",
+                key="sb_wl_chosen",
+            )
+            # 如果下拉变了，更新 global_symbol
+            if chosen != st.session_state["global_symbol"]:
+                st.session_state["global_symbol"] = chosen
+                st.session_state["wl_last_switch"] = chosen
+
+        # 手动输入（如果不在自选里也能用）
+        manual = st.text_input(
+            "或手动输入",
+            value="",
+            placeholder="000001.SZ",
+            help="可填 SZ 前缀或纯数字，自动规范化",
+            key="sb_manual_sym",
         )
+        if manual.strip():
+            from utils.watchlist import _normalize_symbol
+            norm = _normalize_symbol(manual)
+            if norm and norm != st.session_state["global_symbol"]:
+                st.session_state["global_symbol"] = norm
+
         st.session_state.setdefault("global_days", CONFIG.get("backtest", {}).get("days", 250))
         st.session_state["global_days"] = st.slider(
             "默认回测天数", 30, 500, st.session_state["global_days"],
         )
 
+        # 快捷：加当前股票到自选
+        with st.expander("➕ 加到自选", expanded=False):
+            cur_name = ""
+            cur_tags = ""
+            for s in watchlist:
+                if s["symbol"] == st.session_state["global_symbol"]:
+                    cur_name = s.get("name", "")
+                    cur_tags = ",".join(s.get("tags", []))
+                    break
+            name_in = st.text_input("名称", value=cur_name, key="sb_add_name")
+            tags_in = st.text_input("标签 (逗号)", value=cur_tags, key="sb_add_tags")
+            if st.button("➕ 添加/更新", key="sb_add_btn", use_container_width=True):
+                if not st.session_state["global_symbol"]:
+                    st.error("股票代码为空")
+                else:
+                    tags_list = [t.strip() for t in tags_in.split(",") if t.strip()]
+                    # 用 add_stock; 已存在会返回 None — 走 update_stock
+                    result = _wl_add(st.session_state["global_symbol"], name_in, tags_list)
+                    if result is None:
+                        # 已存在 — 更新名称/tags
+                        from utils.watchlist import update_stock as _wl_update
+                        _wl_update(
+                            st.session_state["global_symbol"],
+                            name=name_in,
+                            tags=tags_list,
+                        )
+                        st.success("已更新")
+                    else:
+                        st.success(f"已添加 {result['symbol']}")
+
         st.markdown("---")
-        st.caption("v5.0 | A股量化交易系统")
+        st.caption(f"v6.0 | A股量化交易系统 | 自选 {len(watchlist)} 只")
     return page
 
 
@@ -1169,6 +1239,166 @@ def page_history():
         st.rerun()
 
 
+def page_watchlist():
+    """自选股票管理 — 增/删/启用/标签/导入导出。"""
+    from utils.watchlist import (
+        load_watchlist, save_watchlist, add_stock, remove_stock,
+        update_stock, export_csv, import_csv, is_valid_symbol, _normalize_symbol,
+    )
+
+    st.header("⭐ 自选股票")
+    st.caption(f"持久化到: `{_WATCHLIST_PATH}`")
+
+    stocks = load_watchlist()
+
+    # ============== 添加新股票 ==============
+    st.subheader("➕ 添加股票")
+    with st.form("wl_add"):
+        col1, col2, col3 = st.columns([2, 2, 3])
+        with col1:
+            new_sym = st.text_input("代码", placeholder="000001.SZ 或 sz000001")
+        with col2:
+            new_name = st.text_input("名称 (可选)", placeholder="平安银行")
+        with col3:
+            new_tags = st.text_input("标签 (逗号分隔, 可选)", placeholder="银行,核心")
+        submitted = st.form_submit_button("➕ 添加", use_container_width=True)
+        if submitted:
+            norm = _normalize_symbol(new_sym)
+            if not norm or not is_valid_symbol(norm):
+                st.error(f"代码无效: {new_sym!r} (规范化后={norm!r})")
+            else:
+                tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+                result = add_stock(norm, new_name, tags_list)
+                if result is None:
+                    # 已存在
+                    update_stock(norm, name=new_name, tags=tags_list)
+                    st.success(f"已存在 — 已更新 {norm} 的名称/标签")
+                else:
+                    st.success(f"已添加 {result['symbol']} ({result['name']})")
+                st.rerun()
+
+    st.markdown("---")
+
+    # ============== 当前列表 ==============
+    st.subheader(f"📋 我的自选 ({len(stocks)} 只)")
+
+    if not stocks:
+        st.info("自选为空，先到上面添加几个股票吧")
+        return
+
+    # 表格
+    rows = []
+    for s in stocks:
+        rows.append({
+            "代码": s["symbol"],
+            "名称": s.get("name", "") or "—",
+            "标签": ", ".join(s.get("tags", [])) or "—",
+            "启用": "✅" if s.get("enabled", True) else "⛔",
+            "添加时间": s.get("added", ""),
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ============== 编辑/删除 ==============
+    st.subheader("操作")
+    sym_options = [s["symbol"] for s in stocks]
+    sym_labels = [
+        f"{s['symbol']} — {s.get('name', '') or '无名称'}" for s in stocks
+    ]
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.caption("启用/禁用")
+        sym_map = dict(zip(sym_options, sym_labels))
+        sel_e = st.selectbox(
+            "选择股票", options=sym_options,
+            format_func=lambda x: sym_map.get(x) or x,
+            key="wl_edit_sel", label_visibility="collapsed",
+        )
+        cur = next((s for s in stocks if s["symbol"] == sel_e), None)
+        if cur:
+            new_name = st.text_input("名称", value=cur.get("name", ""), key="wl_edit_name")
+            new_tags = st.text_input(
+                "标签", value=",".join(cur.get("tags", [])),
+                key="wl_edit_tags",
+            )
+            new_enabled = st.checkbox(
+                "启用", value=cur.get("enabled", True), key="wl_edit_enabled",
+            )
+            if st.button("💾 保存修改", key="wl_save", use_container_width=True):
+                tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+                update_stock(
+                    sel_e, name=new_name, tags=tags_list, enabled=new_enabled,
+                )
+                st.success(f"已保存 {sel_e}")
+                st.rerun()
+
+    with col2:
+        st.caption("删除单条")
+        sel_d = st.selectbox(
+            "选择股票", options=sym_options,
+            format_func=lambda x: sym_map.get(x) or x,
+            key="wl_del_sel", label_visibility="collapsed",
+        )
+        if st.button("🗑️ 删除", key="wl_delete", use_container_width=True, type="secondary"):
+            if sel_d:
+                remove_stock(sel_d)
+                st.success(f"已删除 {sel_d}")
+                st.rerun()
+
+    with col3:
+        st.caption("批量操作")
+        st.write("")  # 占位对齐
+        if st.button("🗑️ 清空所有", key="wl_clear", use_container_width=True, type="secondary"):
+            save_watchlist([])
+            st.success("已清空")
+            st.rerun()
+
+    st.markdown("---")
+
+    # ============== 导入导出 ==============
+    st.subheader("📥📤 导入 / 导出")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption("导出 CSV (可邮件分享)")
+        if st.button("📤 导出", key="wl_export", use_container_width=True):
+            csv_content = export_csv()
+            st.download_button(
+                "下载 CSV",
+                data=csv_content,
+                file_name=f"watchlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="wl_download",
+            )
+        # 示例格式
+        st.code(
+            "symbol,name,tags,enabled,added\n"
+            "000001.SZ,平安银行,银行;核心,True,2026-06-03 10:00",
+            language="csv",
+        )
+
+    with col2:
+        st.caption("导入 CSV (粘贴或上传)")
+        uploaded = st.file_uploader("上传 CSV", type=["csv"], key="wl_upload")
+        if uploaded is not None:
+            try:
+                content = uploaded.read().decode("utf-8")
+                n = import_csv(content)
+                st.success(f"导入 {n} 个新股票")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"导入失败: {exc}")
+        pasted = st.text_area("或粘贴 CSV 内容", key="wl_paste", height=100)
+        if st.button("📥 从粘贴导入", key="wl_paste_btn", use_container_width=True):
+            if pasted.strip():
+                n = import_csv(pasted)
+                st.success(f"导入 {n} 个新股票")
+                st.rerun()
+
+
 # 页面路由表 — 精确匹配常量，避免字符串包含误判
 _PAGE_ROUTER = {
     PAGE_BACKTEST: page_backtest,
@@ -1179,6 +1409,7 @@ _PAGE_ROUTER = {
     PAGE_WALK_FORWARD: page_walk_forward,
     PAGE_REALTIME: page_realtime,
     PAGE_HISTORY: page_history,
+    PAGE_WATCHLIST: page_watchlist,
 }
 
 
