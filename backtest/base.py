@@ -406,12 +406,18 @@ class BaseBacktestEngine:
             total_commission += cc
             sc = t.get("slippage_cost", 0.0)
             total_slippage_cost += sc
-            if t["action"] == "SELL":
-                stamp = t["price"] * t["quantity"] * self.stamp_tax
-                total_stamp_tax += stamp
+            st = t.get("stamp_cost", 0.0)
+            if st == 0 and t["action"] == "SELL":
+                # 兼容旧 trade 数据（未拆分 stamp_cost）
+                st = t["price"] * t["quantity"] * self.stamp_tax
+            total_stamp_tax += st
         for t in sell_trades:
             entry_price = t.get("entry_price", 0.0)
-            pnl = (t["price"] - entry_price) * t["quantity"] - t.get("commission_cost", 0.0)
+            cc = t.get("commission_cost", 0.0)
+            st = t.get("stamp_cost", 0.0)
+            if st == 0:
+                st = t["price"] * t["quantity"] * self.stamp_tax
+            pnl = (t["price"] - entry_price) * t["quantity"] - cc - st
             if pnl > 0:
                 win_trades += 1
                 total_profit += pnl

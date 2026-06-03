@@ -437,20 +437,25 @@ def display_trades_table(summary):
     for t in trades:
         action = t.get("action", "")
         # 买入🟢（绿色入场） / 卖出🔴（红色出场）— 与 A 股 UI 惯例一致
-        if action == "buy":
+        if action == "buy" or action == "BUY":
             op_label = "🟢 买入"
-        elif action == "sell":
+        elif action == "sell" or action == "SELL":
             op_label = "🔴 卖出"
         else:
             op_label = f"⚪ {action}"
+        price = t.get("price", 0) or 0
+        qty = t.get("quantity", 0) or 0
+        total_amount = price * qty
+        commission = t.get("commission_cost", 0) or 0
+        stamp = t.get("stamp_cost", 0) or 0
         rows.append({
             "日期": t.get("date", ""),
             "操作": op_label,
-            "价格": f"{t.get('price', 0):.2f}",
-            "数量": t.get("quantity", 0),
-            "金额": f"{t.get('total', 0):,.2f}",
-            "佣金": f"{t.get('commission', 0):.2f}",
-            "印花税": f"{t.get('stamp_tax', 0):.2f}",
+            "价格": f"{price:.2f}",
+            "数量": qty,
+            "金额": f"{total_amount:,.2f}",
+            "佣金": f"{commission:.2f}",
+            "印花税": f"{stamp:.2f}",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, height=300)
 

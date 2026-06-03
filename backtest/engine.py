@@ -319,7 +319,8 @@ class BacktestEngine(BaseBacktestEngine):
                 "price": actual_price,
                 "quantity": position,
                 "entry_price": entry_price,
-                "commission_cost": commission_cost + stamp_cost,
+                "commission_cost": commission_cost,
+                "stamp_cost": stamp_cost,
                 "slippage_cost": slippage_cost,
             }
             self.trades.append(trade)
