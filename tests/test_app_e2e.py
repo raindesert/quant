@@ -33,6 +33,24 @@ class _FakeSession:
 class _FakeCtx:
     def __enter__(self): return self
     def __exit__(self, *a): return False
+    def metric(self, *a, **kw): pass
+    def selectbox(self, *a, **kw): return a[1][0] if len(a) > 1 and a[1] else None
+    def slider(self, *a, **kw): return _fake_slider(*a, **kw)
+    def number_input(self, *a, **kw): return 0
+    def text_input(self, *a, **kw): return ""
+    def checkbox(self, *a, **kw): return a[1] if len(a) > 1 else False
+    def button(self, *a, **kw): return False
+    def caption(self, *a, **kw): pass
+    def markdown(self, *a, **kw): pass
+    def write(self, *a, **kw): pass
+    def plotly_chart(self, *a, **kw): pass
+    def dataframe(self, *a, **kw): pass
+    def json(self, *a, **kw): pass
+    def info(self, *a, **kw): pass
+    def error(self, *a, **kw): pass
+    def warning(self, *a, **kw): pass
+    def success(self, *a, **kw): pass
+    def download_button(self, *a, **kw): pass
 
 
 def _fake_slider(*a, **kw):
@@ -129,6 +147,7 @@ class FakeStreamlitRecorder:
         return decorator
     def multiselect(self, label, options, **kw): return list(options)
     def text_area(self, label, **kw): return ""
+    def caption(self, *a, **kw): pass
 
 
 def _install_fake_streamlit() -> FakeStreamlitRecorder:
@@ -201,6 +220,107 @@ class TestAppPages(unittest.TestCase):
         self._run_page(self.app.PAGE_REALTIME)
         self.assertIn("实时行情", self.rec.headers[0])
 
+    def test_page_history(self):
+        # 空历史：应显示 info，不抛异常
+        self.rec.session_state[self.app.HISTORY_KEY] = []
+        self._run_page(self.app.PAGE_HISTORY)
+
+        # 加 1 条历史：应显示表格
+        rec = {
+            "id": 1, "timestamp": "2026-06-03 10:00:00", "mode": "backtest",
+            "symbol": "000001.SZ", "strategy": "sma",
+            "profit_pct": 1.23, "sharpe_ratio": 0.5, "max_drawdown_pct": -2.0,
+            "win_rate": 60.0, "trades": 5,
+            "summary": {"profit_pct": 1.23, "symbol": "000001.SZ", "strategy": "sma"},
+            "extra": {},
+        }
+        self.rec.session_state[self.app.HISTORY_KEY] = [rec]
+        self._run_page(self.app.PAGE_HISTORY)
+        self.assertIn("回测历史", self.rec.headers[0])
+
+
+class TestHistoryManager(unittest.TestCase):
+    """测试 _history_add / _history_remove / _history_clear 的纯逻辑（不调 st UI）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = _install_fake_streamlit()
+        for mod in list(sys.modules.keys()):
+            if mod == "app" or mod.startswith("app."):
+                del sys.modules[mod]
+        import app  # noqa: F401
+        cls.app = app
+
+    def setUp(self):
+        # 重置
+        self.rec.session_state[self.app.HISTORY_KEY] = []
+
+    def test_history_add_assigns_incrementing_id(self):
+        self.app._history_add({"profit_pct": 1.0, "symbol": "X", "strategy": "sma"})
+        self.app._history_add({"profit_pct": 2.0, "symbol": "Y", "strategy": "rsi"})
+        h = self.rec.session_state[self.app.HISTORY_KEY]
+        self.assertEqual(len(h), 2)
+        self.assertEqual(h[0]["id"], 1)
+        self.assertEqual(h[1]["id"], 2)
+
+    def test_history_add_extracts_metrics(self):
+        self.app._history_add({
+            "profit_pct": 1.5, "sharpe_ratio": 1.2, "max_drawdown_pct": -3.0,
+            "win_rate": 60.0, "trades": 5, "symbol": "X", "strategy": "sma",
+        })
+        h = self.rec.session_state[self.app.HISTORY_KEY][0]
+        self.assertEqual(h["profit_pct"], 1.5)
+        self.assertEqual(h["sharpe_ratio"], 1.2)
+        self.assertEqual(h["max_drawdown_pct"], -3.0)
+        self.assertEqual(h["win_rate"], 60.0)
+        self.assertEqual(h["trades"], 5)
+
+    def test_history_add_keeps_full_summary(self):
+        full = {"profit_pct": 1.0, "equity_curve": [{"date": "d1", "value": 1.0}]}
+        self.app._history_add(full)
+        h = self.rec.session_state[self.app.HISTORY_KEY][0]
+        self.assertIn("equity_curve", h["summary"])
+
+    def test_history_add_with_extra(self):
+        self.app._history_add(
+            {"profit_pct": 1.0}, mode="multi_strategy",
+            extra={"sub_strategies": [{"name": "sma"}, {"name": "rsi"}]},
+        )
+        h = self.rec.session_state[self.app.HISTORY_KEY][0]
+        self.assertEqual(h["mode"], "multi_strategy")
+        self.assertEqual(len(h["extra"]["sub_strategies"]), 2)
+
+    def test_history_remove(self):
+        self.app._history_add({"profit_pct": 1.0})
+        self.app._history_add({"profit_pct": 2.0})
+        self.app._history_add({"profit_pct": 3.0})
+        # 删 id=2
+        self.app._history_remove(2)
+        h = self.rec.session_state[self.app.HISTORY_KEY]
+        self.assertEqual(len(h), 2)
+        self.assertEqual([r["profit_pct"] for r in h], [1.0, 3.0])
+
+    def test_history_remove_nonexistent_no_error(self):
+        self.app._history_add({"profit_pct": 1.0})
+        self.app._history_remove(999)  # 不存在
+        self.assertEqual(len(self.rec.session_state[self.app.HISTORY_KEY]), 1)
+
+    def test_history_clear(self):
+        for i in range(3):
+            self.app._history_add({"profit_pct": float(i)})
+        self.app._history_clear()
+        self.assertEqual(self.rec.session_state[self.app.HISTORY_KEY], [])
+
+    def test_history_max_cap(self):
+        """超过 HISTORY_MAX 删最旧（FIFO）。"""
+        for i in range(self.app.HISTORY_MAX + 5):
+            self.app._history_add({"profit_pct": float(i)})
+        h = self.rec.session_state[self.app.HISTORY_KEY]
+        self.assertEqual(len(h), self.app.HISTORY_MAX)
+        # 最旧的 5 条被删，剩下 profit_pct 从 5 开始
+        self.assertEqual(h[0]["profit_pct"], 5.0)
+        self.assertEqual(h[-1]["profit_pct"], float(self.app.HISTORY_MAX + 4))
+
 
 class TestAppRouter(unittest.TestCase):
     """验证 _PAGE_ROUTER 字典完整性。"""
@@ -215,11 +335,11 @@ class TestAppRouter(unittest.TestCase):
         cls.app = app
 
     def test_router_has_all_pages(self):
-        self.assertEqual(len(self.app._PAGE_ROUTER), 7)
+        self.assertEqual(len(self.app._PAGE_ROUTER), 8)
         for page in [
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
-            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
+            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME, self.app.PAGE_HISTORY,
         ]:
             self.assertIn(page, self.app._PAGE_ROUTER)
             self.assertTrue(callable(self.app._PAGE_ROUTER[page]))
@@ -233,7 +353,7 @@ class TestAppRouter(unittest.TestCase):
         consts = [
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
-            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
+            self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME, self.app.PAGE_HISTORY,
         ]
         self.assertEqual(len(consts), len(set(consts)))
 

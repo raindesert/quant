@@ -1,4 +1,4 @@
-"""A股量化交易系统 - Streamlit 图形化界面 (v5)
+"""A股量化交易系统 - Streamlit 图形化界面 (v6)
 
 页面:
   - 📊 单策略回测 (含分钟级 + HTML 报告下载)
@@ -8,9 +8,11 @@
   - 📁 YAML 预设
   - 🔄 Walk-Forward
   - 📡 实时行情
+  - 🗂️ 回测历史 (新 v6)
 """
 import sys
 from pathlib import Path
+from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -49,10 +51,11 @@ PAGE_MULTI_STRATEGY = "🔀 多策略组合"
 PAGE_YAML = "📁 YAML 预设"
 PAGE_WALK_FORWARD = "🔄 Walk-Forward"
 PAGE_REALTIME = "📡 实时行情"
+PAGE_HISTORY = "🗂️ 回测历史"
 
 ALL_PAGES = [
     PAGE_BACKTEST, PAGE_COMPARISON, PAGE_OPTIMIZE, PAGE_MULTI_STRATEGY,
-    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME,
+    PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME, PAGE_HISTORY,
 ]
 
 
@@ -124,6 +127,61 @@ def metric_card(col, label, value, fmt=".2f", suffix="", is_pct=False):
             <div class="metric-label">{label}</div>
         </div>
         """, unsafe_allow_html=True)
+
+
+# ============== 回测历史 (v6 新增) ==============
+
+HISTORY_KEY = "backtest_history"
+HISTORY_MAX = 50  # 最多保存多少条
+
+
+def _history_add(summary: dict, mode: str = "backtest", extra: dict | None = None):
+    """把一次回测结果追加到 session_state 历史。
+
+    每条记录 = {
+        "id": int (递增),
+        "timestamp": ISO 字符串,
+        "mode": str,
+        "symbol": str,
+        "strategy": str,
+        "profit_pct": float,
+        "sharpe_ratio": float,
+        "max_drawdown_pct": float,
+        "win_rate": float,
+        "trades": int,
+        "summary": dict (完整),
+        "extra": dict (子策略列表等),
+    }
+    """
+    history = st.session_state.setdefault(HISTORY_KEY, [])
+    next_id = max((h["id"] for h in history), default=0) + 1
+    record = {
+        "id": next_id,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": mode,
+        "symbol": summary.get("symbol", "?"),
+        "strategy": summary.get("strategy", "?"),
+        "profit_pct": summary.get("profit_pct", 0.0),
+        "sharpe_ratio": summary.get("sharpe_ratio", 0.0),
+        "max_drawdown_pct": summary.get("max_drawdown_pct", 0.0),
+        "win_rate": summary.get("win_rate", 0.0),
+        "trades": summary.get("trades", 0),
+        "summary": summary,
+        "extra": extra or {},
+    }
+    history.append(record)
+    # 超过上限，删最旧（FIFO）
+    if len(history) > HISTORY_MAX:
+        history.pop(0)
+
+
+def _history_remove(record_id: int):
+    history = st.session_state.get(HISTORY_KEY, [])
+    st.session_state[HISTORY_KEY] = [h for h in history if h["id"] != record_id]
+
+
+def _history_clear():
+    st.session_state[HISTORY_KEY] = []
 
 
 def build_risk_manager(risk_enabled, max_position_pct, max_positions, max_drawdown_pct, max_daily_loss_pct, max_stock_loss_pct):
@@ -335,9 +393,11 @@ def page_backtest():
         # 加 strategy 字段到 summary（让 HTML 报告标题能正确显示）
         summary["strategy"] = strategy_name
         summary["symbol"] = symbol
+        # 写回 session_state + 追加到历史
         st.session_state["last_summary"] = summary
         st.session_state["last_symbol"] = symbol
         st.session_state["last_strategy"] = strategy_name
+        _history_add(summary, mode="backtest")
 
     if "last_summary" in st.session_state:
         summary = st.session_state["last_summary"]
@@ -671,6 +731,15 @@ def page_multi_strategy():
                 return
 
         st.session_state["ms_result"] = result
+        # 入历史（组合 + 子策略）
+        if isinstance(result, dict) and "combined" in result:
+            combined = dict(result["combined"])
+            combined["strategy"] = f"multi({len(result.get('strategies', []))})"
+            combined["symbol"] = symbol
+            _history_add(
+                combined, mode="multi_strategy",
+                extra={"sub_strategies": result.get("strategies", [])},
+            )
 
     if "ms_result" not in st.session_state:
         return
@@ -957,6 +1026,149 @@ def page_realtime():
             st.rerun()
 
 
+def page_history():
+    """回测历史 — 表格/趋势图/加载/导出。"""
+    st.header("🗂️ 回测历史")
+    st.caption("所有在当前 session 跑过的回测结果都会自动入库")
+
+    history = st.session_state.get(HISTORY_KEY, [])
+
+    if not history:
+        st.info("暂无历史记录。先到「单策略回测」或「多策略组合」跑几次。")
+        return
+
+    # ============== 概览 ==============
+    n = len(history)
+    profitable = sum(1 for h in history if h["profit_pct"] > 0)
+    avg_p = sum(h["profit_pct"] for h in history) / n
+    best = max(history, key=lambda h: h["profit_pct"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总回测数", n)
+    c2.metric("盈利次数", f"{profitable}/{n}")
+    c3.metric("平均收益率", f"{avg_p:+.2f}%")
+    c4.metric("最佳回测", f"{best['profit_pct']:+.2f}%", help=f"{best['symbol']} {best['strategy']}")
+
+    st.markdown("---")
+
+    # ============== 趋势图 ==============
+    st.subheader("收益趋势")
+    fig = go.Figure()
+    symbols_seen = set()
+    for h in history:
+        if h["symbol"] in symbols_seen:
+            continue
+        symbols_seen.add(h["symbol"])
+        same_symbol = [r for r in history if r["symbol"] == h["symbol"]]
+        same_symbol.sort(key=lambda r: r["timestamp"])
+        fig.add_trace(go.Scatter(
+            x=[r["timestamp"] for r in same_symbol],
+            y=[r["profit_pct"] for r in same_symbol],
+            name=h["symbol"],
+            mode="lines+markers",
+        ))
+    fig.update_layout(
+        height=300, yaxis_title="收益率%",
+        legend=dict(orientation="h", y=1.02),
+        xaxis_title="时间",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ============== 表格 ==============
+    st.subheader(f"回测列表 (按时间倒序)")
+
+    rows = []
+    for h in reversed(history):
+        rows.append({
+            "id": h["id"],
+            "时间": h["timestamp"],
+            "模式": h["mode"],
+            "股票": h["symbol"],
+            "策略": h["strategy"],
+            "收益率%": f"{h['profit_pct']:+.2f}",
+            "夏普": f"{h['sharpe_ratio']:.2f}",
+            "回撤%": f"{h['max_drawdown_pct']:.2f}",
+            "胜率%": f"{h['win_rate']:.1f}",
+            "交易数": h["trades"],
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True, height=300)
+
+    # ============== 操作 ==============
+    st.markdown("---")
+    st.subheader("操作")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.caption("加载到单策略回测主视图")
+        selected_id_l = st.selectbox(
+            "加载",
+            options=[h["id"] for h in reversed(history)],
+            format_func=lambda rid: next(
+                f"#{rid} {h['symbol']}/{h['strategy']} ({h['timestamp']})"
+                for h in history if h["id"] == rid
+            ),
+            key="hist_load_select",
+            label_visibility="collapsed",
+        )
+        if st.button("📂 加载", key="hist_load", use_container_width=True):
+            if selected_id_l is not None:
+                rec = next((h for h in history if h["id"] == selected_id_l), None)
+                if rec:
+                    st.session_state["last_summary"] = rec["summary"]
+                    st.session_state["last_symbol"] = rec["symbol"]
+                    st.session_state["last_strategy"] = rec["strategy"]
+                    st.success(f"已加载 #{rec['id']} {rec['symbol']}/{rec['strategy']} 到 📊 单策略回测")
+
+    with col2:
+        st.caption("导出回测为 JSON")
+        selected_id_e = st.selectbox(
+            "导出",
+            options=[h["id"] for h in reversed(history)],
+            format_func=lambda rid: next(
+                f"#{rid} {h['symbol']}/{h['strategy']}" for h in history if h["id"] == rid
+            ),
+            key="hist_export_select",
+            label_visibility="collapsed",
+        )
+        if st.button("📥 下载 JSON", key="hist_export", use_container_width=True):
+            if selected_id_e is not None:
+                import json
+                rec = next((h for h in history if h["id"] == selected_id_e), None)
+                if rec:
+                    st.download_button(
+                        "下载",
+                        data=json.dumps(rec["summary"], ensure_ascii=False, indent=2, default=str),
+                        file_name=f"{rec['symbol']}_{rec['strategy']}_{rec['timestamp'].replace(' ', '_').replace(':', '')}.json",
+                        mime="application/json",
+                        key="hist_download_btn",
+                    )
+
+    with col3:
+        st.caption("删除单条记录")
+        selected_id_d = st.selectbox(
+            "删除",
+            options=[h["id"] for h in reversed(history)],
+            format_func=lambda rid: next(
+                f"#{rid} {h['symbol']}/{h['strategy']}" for h in history if h["id"] == rid
+            ),
+            key="hist_delete_select",
+            label_visibility="collapsed",
+        )
+        if st.button("🗑️ 删除", key="hist_delete", use_container_width=True):
+            if selected_id_d is not None:
+                _history_remove(selected_id_d)
+                st.success(f"已删除 #{selected_id_d}")
+                st.rerun()
+
+    st.markdown("---")
+    if st.button("🗑️ 清空所有历史", key="hist_clear", type="secondary"):
+        _history_clear()
+        st.success("已清空")
+        st.rerun()
+
+
 # 页面路由表 — 精确匹配常量，避免字符串包含误判
 _PAGE_ROUTER = {
     PAGE_BACKTEST: page_backtest,
@@ -966,6 +1178,7 @@ _PAGE_ROUTER = {
     PAGE_YAML: page_yaml_preset,
     PAGE_WALK_FORWARD: page_walk_forward,
     PAGE_REALTIME: page_realtime,
+    PAGE_HISTORY: page_history,
 }
 
 
