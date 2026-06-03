@@ -1052,47 +1052,263 @@ def page_walk_forward():
         st.plotly_chart(fig, use_container_width=True)
 
 
+def _fetch_realtime_one(symbol: str) -> dict | None:
+    """抓单只股票实时行情（带错误处理）。"""
+    try:
+        fetcher = DataFetcher()
+        data = fetcher.get_realtime(symbol)
+        return data
+    except Exception as exc:
+        return {"error": str(exc), "symbol": symbol}
+
+
+@st.cache_data(ttl=30, show_spinner="获取实时行情...")
+def _fetch_realtime_batch(symbols: tuple[str, ...]) -> dict[str, dict]:
+    """批量抓取多只股票实时行情，30 秒缓存。
+
+    返回: {symbol: {name, price, change_pct, ...} 或 {"error": str}}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    result = {}
+    if not symbols:
+        return result
+    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+        futures = {pool.submit(_fetch_realtime_one, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                r = fut.result(timeout=15)
+            except Exception as exc:
+                r = {"error": str(exc)}
+            result[sym] = r or {"error": "no data", "symbol": sym}
+    return result
+
+
 def page_realtime():
+    """实时行情（v7 升级：自选 + 手动 + 详情 + 加/删自选 + 30s 缓存）。"""
     st.header("📡 实时行情")
 
     with st.sidebar:
         st.markdown("### 行情参数")
-        symbols_text = st.text_area("股票代码（逗号分隔）", value="000001.SZ,600000.SH")
-        auto_refresh = st.checkbox("自动刷新", value=False)
-        refresh_interval = st.slider("刷新间隔(秒)", 5, 60, 15, key="rt_interval")
+        auto_refresh = st.checkbox("自动刷新", value=False, key="rt_auto")
+        refresh_interval = st.slider("刷新间隔(秒)", 10, 120, 30, key="rt_interval",
+                                     help="缓存 30 秒，太短可能拿不到新数据")
 
-    symbols = [s.strip() for s in symbols_text.split(",") if s.strip()]
+    # 三个 tab
+    tab_wl, tab_manual, tab_detail = st.tabs(["⭐ 自选股票", "✍️ 手动输入", "🔍 详情"])
 
-    if st.button("🔄 获取行情", use_container_width=True) or auto_refresh:
-        fetcher = DataFetcher()
-        rows = []
-        for sym in symbols:
-            try:
-                data = fetcher.get_realtime(sym)
-                if data:
-                    change = data.get("change_pct", 0)
+    # ============ Tab 1: 自选股票 ============
+    with tab_wl:
+        watchlist = _wl_load()
+        enabled = [s for s in watchlist if s.get("enabled", True)]
+        if not enabled:
+            st.info("自选为空。先到 ⭐ 自选股票页添加。")
+        else:
+            st.caption(f"自选 {len(enabled)} 只（30s 缓存）")
+            symbols = tuple(s["symbol"] for s in enabled)
+            # 强制刷新按钮
+            cols = st.columns([3, 1])
+            with cols[1]:
+                if st.button("🔄 立即刷新", key="rt_wl_refresh", use_container_width=True):
+                    _fetch_realtime_batch.clear()
+                    st.rerun()
+            with cols[0]:
+                pass  # 占位对齐
+            with st.spinner(f"获取 {len(symbols)} 只股票..."):
+                data = _fetch_realtime_batch(symbols)
+            # 渲染
+            for s in enabled:
+                sym = s["symbol"]
+                quote = data.get(sym, {})
+                _render_quote_card(s, quote, key_prefix=f"rt_wl_{sym}")
+
+    # ============ Tab 2: 手动输入 ============
+    with tab_manual:
+        manual_text = st.text_area(
+            "股票代码（逗号分隔）",
+            value="000001.SZ,600000.SH",
+            key="rt_manual_text",
+            height=80,
+        )
+        cols = st.columns([1, 1])
+        with cols[0]:
+            refresh_now = st.button("🔄 获取行情", key="rt_manual_refresh",
+                                     use_container_width=True)
+        with cols[1]:
+            if st.button("➕ 全部加入自选", key="rt_manual_add_all",
+                         use_container_width=True):
+                from utils.watchlist import _normalize_symbol as _norm
+                added = 0
+                for raw in manual_text.split(","):
+                    sym = _norm(raw)
+                    if sym and _wl_add(sym):
+                        added += 1
+                st.success(f"已添加 {added} 只")
+
+        if refresh_now:
+            from utils.watchlist import _normalize_symbol as _norm
+            symbols = tuple(filter(None, [_norm(s) for s in manual_text.split(",")]))
+            _fetch_realtime_batch.clear()
+            with st.spinner(f"获取 {len(symbols)} 只..."):
+                data = _fetch_realtime_batch(symbols)
+            # 显示
+            rows = []
+            for sym in symbols:
+                q = data.get(sym, {})
+                if "error" in q:
+                    rows.append({"代码": sym, "状态": f"❌ {q['error']}"})
+                else:
                     rows.append({
                         "代码": sym,
-                        "名称": data.get("name", ""),
-                        "现价": data.get("price", 0),
-                        "涨跌幅%": f"{change:+.2f}",
-                        "成交量": f"{data.get('volume', 0):,}",
-                        "成交额": f"{data.get('amount', 0):,.0f}",
-                        "今开": data.get("open", 0),
-                        "最高": data.get("high", 0),
-                        "最低": data.get("low", 0),
+                        "名称": q.get("name", ""),
+                        "现价": f"{q.get('price', 0):.2f}",
+                        "涨跌幅%": f"{q.get('change_pct', 0):+.2f}",
+                        "今开": f"{q.get('open', 0):.2f}",
+                        "最高": f"{q.get('high', 0):.2f}",
+                        "最低": f"{q.get('low', 0):.2f}",
                     })
-            except Exception:
-                rows.append({"代码": sym, "名称": "获取失败"})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        elif not refresh_now:
+            st.caption("点上面按钮获取行情")
 
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, height=400)
+    # ============ Tab 3: 详情 ============
+    with tab_detail:
+        watchlist = _wl_load()
+        all_syms = [s["symbol"] for s in watchlist]
+        if not all_syms:
+            st.info("自选为空，先添加股票")
         else:
-            st.warning("无法获取行情数据")
+            sel = st.selectbox(
+                "选择股票",
+                options=all_syms,
+                format_func=lambda x: next(
+                    f"{s['symbol']} — {s.get('name', '') or '无'}" for s in watchlist
+                    if s["symbol"] == x
+                ),
+                key="rt_detail_sel",
+            )
+            if st.button("📊 加载详情", key="rt_detail_load", use_container_width=True):
+                if not sel:
+                    st.error("请先选择股票")
+                else:
+                    quote = _fetch_realtime_batch((sel,)).get(sel, {})
+                    if "error" in quote:
+                        st.error(f"获取失败: {quote['error']}")
+                    else:
+                        st.session_state["rt_detail_quote"] = quote
 
-        if auto_refresh:
-            import time
-            time.sleep(refresh_interval)
+            quote = st.session_state.get("rt_detail_quote")
+            if quote and quote.get("symbol") == sel:
+                _render_quote_detail(quote)
+
+    # 自动刷新
+    if auto_refresh:
+        import time
+        time.sleep(refresh_interval)
+        st.rerun()
+
+
+def _render_quote_card(stock: dict, quote: dict, key_prefix: str = ""):
+    """渲染单只股票的行情卡片（含加/删自选按钮）。"""
+    sym = stock["symbol"]
+    name = stock.get("name", "") or quote.get("name", "")
+    if "error" in quote:
+        with st.container(border=True):
+            cols = st.columns([3, 1])
+            with cols[0]:
+                st.markdown(f"**{sym}** — {name}")
+                st.error(f"❌ {quote['error']}")
+            with cols[1]:
+                st.write("")
+            return
+
+    price = quote.get("price", 0)
+    change_pct = quote.get("change_pct", 0)
+    prev_close = quote.get("prev_close", 0)
+    is_up = change_pct > 0
+    is_down = change_pct < 0
+    color = "#d32f2f" if is_up else ("#388e3c" if is_down else "#666666")
+    arrow = "🔴" if is_up else ("🟢" if is_down else "⚪")
+
+    with st.container(border=True):
+        cols = st.columns([3, 2, 2, 1])
+        with cols[0]:
+            st.markdown(f"**{sym}** — {name}")
+            st.caption(f"今开 {quote.get('open', 0):.2f} | 昨收 {prev_close:.2f}")
+        with cols[1]:
+            st.markdown(
+                f"<div style='font-size:1.5em; color:{color}; font-weight:bold;'>"
+                f"{arrow} {price:.2f}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='color:{color};'>{change_pct:+.2f}%</div>",
+                unsafe_allow_html=True,
+            )
+        with cols[2]:
+            st.metric("最高", f"{quote.get('high', 0):.2f}", delta=None)
+            st.metric("最低", f"{quote.get('low', 0):.2f}", delta=None)
+        with cols[3]:
+            # 详情按钮 — 把 quote 存到 session_state
+            if st.button("🔍", key=f"{key_prefix}_detail", use_container_width=True,
+                         help="看详情"):
+                st.session_state["rt_detail_quote"] = quote
+                st.session_state["rt_detail_page"] = True
+            # 删自选
+            if st.button("➖", key=f"{key_prefix}_remove", use_container_width=True,
+                         help="从自选移除"):
+                from utils.watchlist import remove_stock
+                remove_stock(sym)
+                st.rerun()
+
+
+def _render_quote_detail(quote: dict):
+    """渲染股票详情卡片。"""
+    sym = quote.get("symbol", "")
+    name = quote.get("name", "")
+    price = quote.get("price", 0)
+    change_pct = quote.get("change_pct", 0)
+    color = "#d32f2f" if change_pct > 0 else ("#388e3c" if change_pct < 0 else "#666")
+
+    st.markdown(
+        f"### {sym} — {name}  "
+        f"<span style='color:{color}; font-size:1.3em; font-weight:bold;'>"
+        f"{price:.2f} ({change_pct:+.2f}%)</span>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"更新时间: {quote.get('timestamp', '')}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("今开", f"{quote.get('open', 0):.2f}")
+    c2.metric("昨收", f"{quote.get('prev_close', 0):.2f}")
+    c3.metric("最高", f"{quote.get('high', 0):.2f}")
+    c4.metric("最低", f"{quote.get('low', 0):.2f}")
+
+    c1, c2 = st.columns(2)
+    c1.metric("成交量", f"{quote.get('volume', 0):,.0f}")
+    c2.metric("成交额", f"{quote.get('amount', 0):,.0f}")
+
+    st.markdown("---")
+    cols = st.columns(3)
+    with cols[0]:
+        # 加自选 / 已在自选
+        from utils.watchlist import get_enabled_symbols
+        if sym in get_enabled_symbols():
+            st.success("✅ 已在自选")
+        else:
+            if st.button("➕ 加到自选", key="rt_detail_add", use_container_width=True):
+                _wl_add(sym, name)
+                st.success(f"已添加 {sym}")
+                st.rerun()
+    with cols[1]:
+        if st.button("📊 跳到回测", key="rt_detail_goto_bt",
+                     use_container_width=True, help="跳到单策略回测"):
+            st.session_state["global_symbol"] = sym
+            st.info(f"已设置 global_symbol={sym}，切到 📊 单策略回测")
+    with cols[2]:
+        if st.button("🔄 刷新", key="rt_detail_refresh", use_container_width=True):
+            _fetch_realtime_batch.clear()
             st.rerun()
 
 

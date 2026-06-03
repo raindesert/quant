@@ -157,6 +157,11 @@ class FakeStreamlitRecorder:
             def __enter__(self_): return self_
             def __exit__(self_, *a): return False
         return _E()
+    def container(self, *a, **kw):
+        class _C:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+        return _C()
 
 
 def _install_fake_streamlit() -> FakeStreamlitRecorder:
@@ -226,8 +231,50 @@ class TestAppPages(unittest.TestCase):
         self.assertIn("Walk-Forward", self.rec.headers[0])
 
     def test_page_realtime(self):
+        # 空自选 + 无手动输入：3 个 tab 都能跑
         self._run_page(self.app.PAGE_REALTIME)
         self.assertIn("实时行情", self.rec.headers[0])
+
+        # 加 1 个自选：tab 1 卡片渲染
+        from utils.watchlist import save_watchlist, add_stock
+        from utils.watchlist import DEFAULT_PATH as real_path
+        import tempfile
+        from pathlib import Path
+        tmp_dir = Path(tempfile.mkdtemp())
+        backup = tmp_dir / "real_watchlist_backup.json"
+        real_existed = real_path.exists()
+        if real_existed:
+            backup.write_text(real_path.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            add_stock("000001.SZ", "平安银行", ["银行"])
+            self._run_page(self.app.PAGE_REALTIME)
+            self.assertIn("实时行情", self.rec.headers[0])
+        finally:
+            if real_existed and backup.exists():
+                real_path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+            else:
+                if real_path.exists():
+                    real_path.unlink()
+
+    def test_page_realtime_cards(self):
+        """测试 _render_quote_card / _render_quote_detail 不抛异常。"""
+        stock = {"symbol": "000001.SZ", "name": "平安银行", "tags": []}
+        quote_ok = {
+            "symbol": "000001.SZ", "name": "平安银行",
+            "price": 10.5, "change_pct": 1.5, "prev_close": 10.35,
+            "open": 10.4, "high": 10.6, "low": 10.3,
+            "volume": 1000000, "amount": 10500000,
+            "timestamp": "2026-06-03 10:30:00",
+        }
+        # 不抛异常即可
+        self.app._render_quote_card(stock, quote_ok, key_prefix="test_ok")
+        # 错误行情
+        self.app._render_quote_card(
+            stock, {"error": "network down", "symbol": "000001.SZ"},
+            key_prefix="test_err",
+        )
+        # 详情
+        self.app._render_quote_detail(quote_ok)
 
     def test_page_history(self):
         # 空历史：应显示 info，不抛异常
