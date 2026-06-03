@@ -1,9 +1,13 @@
 """回测结果导出模块：JSON/CSV 导出 + 权益曲线图表生成。"""
 from __future__ import annotations
 
+import base64
 import csv
+import io
 import json
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -372,3 +376,296 @@ def plot_strategy_comparison(
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"策略对比图已保存: {output_path}")
+
+
+# ================== HTML 报告 ==================
+
+_HTML_CSS = """
+:root {
+  --bg: #0f1419; --fg: #e6e6e6; --muted: #8b949e;
+  --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+  --yellow: #d29922; --card: #161b22; --border: #30363d;
+}
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: var(--bg); color: var(--fg); margin: 0; padding: 20px; line-height: 1.5; }
+h1, h2, h3 { color: var(--fg); margin-top: 1.5em; }
+h1 { border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+h2 { color: var(--accent); }
+.container { max-width: 1200px; margin: 0 auto; }
+.meta { color: var(--muted); font-size: 0.9em; margin-bottom: 1em; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+         gap: 12px; margin: 16px 0; }
+.card { background: var(--card); border: 1px solid var(--border);
+        border-radius: 8px; padding: 12px 16px; }
+.card .label { color: var(--muted); font-size: 0.85em; margin-bottom: 4px; }
+.card .value { font-size: 1.5em; font-weight: 600; }
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+.neu { color: var(--yellow); }
+table { border-collapse: collapse; width: 100%; margin: 12px 0;
+        background: var(--card); }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+th { background: rgba(255,255,255,0.05); font-weight: 600; }
+tr:hover { background: rgba(255,255,255,0.02); }
+.chart { background: var(--card); border: 1px solid var(--border);
+         border-radius: 8px; padding: 12px; margin: 16px 0; }
+.chart img { width: 100%; height: auto; display: block; }
+.footer { color: var(--muted); font-size: 0.85em; text-align: center;
+          margin-top: 2em; padding-top: 1em; border-top: 1px solid var(--border); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+         font-size: 0.8em; background: var(--border); color: var(--fg); }
+"""
+
+
+def _fig_to_base64(fig) -> str:
+    """matplotlib figure → base64 PNG（嵌入 HTML）。"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("ascii")
+
+
+def _format_pct(value, signed: bool = True) -> str:
+    """格式化为带颜色 class 的百分比。"""
+    if value is None or not isinstance(value, (int, float)):
+        return '<span class="neu">N/A</span>'
+    css = "pos" if value > 0 else ("neg" if value < 0 else "neu")
+    sign = "+" if signed and value > 0 else ""
+    return f'<span class="{css}">{sign}{value:.2f}%</span>'
+
+
+def _safe_metric(summary: dict, key: str, default: Any = 0) -> Any:
+    return summary.get(key, default) if isinstance(summary, dict) else default
+
+
+def export_html_report(
+    summary: dict,
+    output_path: str | Path,
+    title: str | None = None,
+    trades: list[dict] | None = None,
+    include_charts: bool = True,
+) -> Path:
+    """生成单文件 HTML 回测报告（自包含：CSS 内嵌 + 图表 base64 嵌入）。
+
+    Args:
+        summary: 回测结果 dict（含 profit_pct, sharpe_ratio, max_drawdown_pct 等）
+        output_path: 输出 .html 路径
+        title: 报告标题（默认用 symbol + strategy）
+        trades: 交易记录列表（可选，会渲染明细表）
+        include_charts: 是否生成权益曲线 + 回撤曲线（需要 matplotlib）
+
+    Returns:
+        output_path
+    """
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not title:
+        symbol = summary.get("symbol", "未知")
+        strategy = summary.get("strategy", "未知策略")
+        title = f"{symbol} · {strategy} · 回测报告"
+
+    # 关键指标
+    cards = [
+        ("总收益率", _format_pct(_safe_metric(summary, "profit_pct"))),
+        ("年化收益", _format_pct(_safe_metric(summary, "annual_return"))),
+        ("夏普比率", f'{_safe_metric(summary, "sharpe_ratio", 0):.2f}'),
+        ("最大回撤", _format_pct(_safe_metric(summary, "max_drawdown_pct"), signed=False)),
+        ("胜率", _format_pct(_safe_metric(summary, "win_rate"))),
+        ("交易次数", f'{_safe_metric(summary, "trades", 0)}'),
+        ("盈利因子", f'{_safe_metric(summary, "profit_factor", 0):.2f}'),
+        ("最终权益", f'{_safe_metric(summary, "final_value", 0):,.0f}'),
+    ]
+
+    cards_html = "\n".join(
+        f'<div class="card"><div class="label">{label}</div><div class="value">{val}</div></div>'
+        for label, val in cards
+    )
+
+    # 图表（用 matplotlib 生成）
+    charts_html = ""
+    if include_charts:
+        charts_html = _build_charts_html(summary)
+
+    # 交易明细表
+    trades_html = ""
+    if trades:
+        # 取前 50 条
+        rows = trades[:50]
+        rows_html = "\n".join(
+            f"<tr><td>{t.get('date', '')}</td>"
+            f"<td>{t.get('action', '')}</td>"
+            f"<td>{t.get('price', '')}</td>"
+            f"<td>{t.get('shares', '')}</td>"
+            f"<td>{t.get('amount', '')}</td></tr>"
+            for t in rows
+        )
+        more = f'<p class="meta">（仅显示前 50 条，共 {len(trades)} 条）</p>' if len(trades) > 50 else ""
+        trades_html = f"""
+<h2>交易明细</h2>
+<table>
+<thead><tr><th>日期</th><th>动作</th><th>价格</th><th>数量</th><th>金额</th></tr></thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+{more}
+"""
+
+    meta = f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    if "symbol" in summary:
+        meta = f"标的: {summary['symbol']} · {meta}"
+    if "start_date" in summary and "end_date" in summary:
+        meta += f" · 区间: {summary['start_date']} ~ {summary['end_date']}"
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+<div class="container">
+<h1>{title}</h1>
+<p class="meta">{meta}</p>
+
+<h2>关键指标</h2>
+<div class="cards">
+{cards_html}
+</div>
+
+{charts_html}
+
+{trades_html}
+
+<p class="footer">Generated by quant · {datetime.now().year}</p>
+</div>
+</body>
+</html>
+"""
+
+    out_path.write_text(html, encoding="utf-8")
+    print(f"HTML 报告已保存: {out_path}")
+    return out_path
+
+
+def _build_charts_html(summary: dict) -> str:
+    """从 summary 的 equity_curve / benchmark_curve 生成 2 张图，返回 HTML。"""
+    equity_curve = summary.get("equity_curve")
+    benchmark_curve = summary.get("benchmark_curve")
+    if not equity_curve:
+        return ""
+
+    df = pd.DataFrame(equity_curve)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+
+    # 权益曲线
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(df.index, df["value"], label="策略", linewidth=2, color="#58a6ff")
+    if benchmark_curve:
+        bench_df = pd.DataFrame(benchmark_curve)
+        if "date" in bench_df.columns:
+            bench_df["date"] = pd.to_datetime(bench_df["date"])
+            bench_df = bench_df.set_index("date")
+        ax.plot(bench_df.index, bench_df["value"], label="基准",
+                linewidth=1.5, color="#8b949e", linestyle="--", alpha=0.7)
+    ax.set_title("权益曲线", fontsize=14, fontweight="bold")
+    ax.set_xlabel("日期")
+    ax.set_ylabel("权益")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    equity_b64 = _fig_to_base64(fig)
+
+    # 回撤曲线
+    values = df["value"].astype(float)
+    running_max = values.cummax()
+    drawdown = (values - running_max) / running_max * 100
+    fig2, ax2 = plt.subplots(figsize=(10, 3))
+    ax2.fill_between(df.index, drawdown, 0, color="#f85149", alpha=0.4)
+    ax2.plot(df.index, drawdown, color="#f85149", linewidth=1)
+    ax2.set_title("回撤曲线", fontsize=14, fontweight="bold")
+    ax2.set_xlabel("日期")
+    ax2.set_ylabel("回撤 (%)")
+    ax2.grid(True, alpha=0.3)
+    fig2.autofmt_xdate()
+    fig2.tight_layout()
+    dd_b64 = _fig_to_base64(fig2)
+
+    return f"""
+<h2>图表</h2>
+<div class="chart"><img src="data:image/png;base64,{equity_b64}" alt="权益曲线"></div>
+<div class="chart"><img src="data:image/png;base64,{dd_b64}" alt="回撤曲线"></div>
+"""
+
+
+def export_html_comparison(
+    results: list[dict],
+    output_path: str | Path,
+    title: str = "策略对比报告",
+) -> Path:
+    """多策略对比 HTML 报告。
+
+    Args:
+        results: list[dict], 每个 dict 包含 strategy / symbol + 指标
+        output_path: 输出 .html 路径
+    """
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not results:
+        raise ValueError("results 不能为空")
+
+    # 表格行
+    rows_html = "\n".join(
+        f"<tr><td>{r.get('strategy', '')}</td>"
+        f"<td>{r.get('symbol', '')}</td>"
+        f"<td>{_format_pct(r.get('profit_pct'))}</td>"
+        f"<td>{_format_pct(r.get('annual_return'))}</td>"
+        f"<td>{r.get('sharpe_ratio', 0):.2f}</td>"
+        f"<td>{_format_pct(r.get('max_drawdown_pct'), signed=False)}</td>"
+        f"<td>{_format_pct(r.get('win_rate'))}</td>"
+        f"<td>{r.get('trades', 0)}</td>"
+        f"<td>{r.get('profit_factor', 0):.2f}</td></tr>"
+        for r in results
+    )
+
+    meta = f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+<div class="container">
+<h1>{title}</h1>
+<p class="meta">{meta} · 共 {len(results)} 个策略结果</p>
+
+<h2>策略对比</h2>
+<table>
+<thead><tr>
+<th>策略</th><th>标的</th><th>收益率</th><th>年化</th><th>夏普</th>
+<th>回撤</th><th>胜率</th><th>交易数</th><th>盈利因子</th>
+</tr></thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+
+<p class="footer">Generated by quant · {datetime.now().year}</p>
+</div>
+</body>
+</html>
+"""
+    out_path.write_text(html, encoding="utf-8")
+    print(f"对比 HTML 报告已保存: {out_path}")
+    return out_path
+

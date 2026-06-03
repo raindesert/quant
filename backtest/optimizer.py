@@ -1,7 +1,11 @@
-"""策略参数优化器：Grid Search 暴力搜索最优参数组合。"""
+"""策略参数优化器：支持 Grid Search + 贝叶斯/随机搜索（optuna）。
+
+贝叶斯/随机搜索在参数维度 >5 或大范围时显著优于 Grid。
+"""
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from enum import Enum
 from itertools import product
 from typing import Any, Callable
 
@@ -27,6 +31,67 @@ OPTIMIZE_METRICS = {
     "max_drawdown_pct": "最大回撤 (%)",  # 越小越好
     "win_rate": "胜率 (%)",
 }
+
+
+class OptimizeMethod(str, Enum):
+    GRID = "grid"
+    RANDOM = "random"
+    BAYESIAN = "bayesian"
+
+    @classmethod
+    def from_str(cls, s: str) -> "OptimizeMethod":
+        s = s.lower().strip()
+        for m in cls:
+            if m.value == s:
+                return m
+        raise ValueError(
+            f"未知优化方法 {s!r}，可选: {[m.value for m in cls]}"
+        )
+
+
+# 越小越好的指标
+_LOWER_IS_BETTER = {"max_drawdown_pct"}
+
+
+def _is_higher_better(metric: str) -> bool:
+    return metric not in _LOWER_IS_BETTER
+
+
+def _make_suggester(name: str, values, method: "OptimizeMethod"):
+    """根据 param_grid 值的形式返回 optuna suggest 函数。
+
+    支持：
+    - list → 离散候选（categorical）
+    - (low, high) 元组 → int 或 float 范围（看 low 类型）
+    """
+    import optuna
+
+    if isinstance(values, (list, tuple)) and not (
+        isinstance(values, tuple) and len(values) == 2
+        and all(isinstance(v, (int, float)) for v in values)
+    ):
+        # 离散候选
+        choices = list(values)
+
+        def suggest_categorical(trial):
+            return trial.suggest_categorical(name, choices)
+        return suggest_categorical
+
+    if isinstance(values, tuple) and len(values) == 2:
+        low, high = values
+        if isinstance(low, int) and isinstance(high, int):
+            def suggest_int(trial, _low=low, _high=high):
+                return trial.suggest_int(name, _low, _high)
+            return suggest_int
+        else:
+            def suggest_float(trial, _low=low, _high=high):
+                return trial.suggest_float(name, _low, _high)
+            return suggest_float
+
+    raise ValueError(
+        f"参数 {name!r} 的定义 {values!r} 不合法。"
+        "应为 list（离散候选）或 (low, high) 元组（范围）。"
+    )
 
 
 def _run_single_backtest(args_tuple) -> dict:
@@ -116,20 +181,43 @@ class StrategyOptimizer:
         self.risk_params = risk_params
         self.walk_forward = walk_forward
 
-    def optimize(self, param_grid: dict[str, list]) -> dict[str, Any]:
-        """运行 Grid Search。
+    def optimize(
+        self,
+        param_grid: dict[str, list],
+        method: str | OptimizeMethod = OptimizeMethod.GRID,
+        n_trials: int = 50,
+        n_jobs: int | None = None,
+    ) -> dict[str, Any]:
+        """运行参数优化。
 
         Args:
-            param_grid: 参数名 -> 候选值列表，如 {"fast": [5,10], "slow": [30,60]}
-
-        Returns:
-            包含 best_params, best_score, all_results 的字典
+            param_grid: 参数名 -> 候选值列表
+                Grid 模式: 笛卡尔积遍历所有组合
+                Random/Bayes 模式: 每个值是 (low, high) 元组或离散整数列表
+                    - [5, 10, 20] → 离散候选（categorical）
+                    - (1, 50) → 整数范围
+                    - (0.01, 0.5) → 浮点范围
+            method: 'grid' / 'random' / 'bayesian'
+            n_trials: 随机/贝叶斯模式的采样次数（Grid 模式忽略）
+            n_jobs: 进程数（None 用 self.workers）
         """
+        if isinstance(method, str):
+            method = OptimizeMethod.from_str(method)
+
+        if method == OptimizeMethod.GRID:
+            return self._optimize_grid(param_grid)
+        else:
+            return self._optimize_search(
+                param_grid, method=method, n_trials=n_trials, n_jobs=n_jobs
+            )
+
+    def _optimize_grid(self, param_grid: dict[str, list]) -> dict[str, Any]:
+        """Grid Search（暴力遍历所有组合）。"""
         keys = list(param_grid.keys())
         values = list(param_grid.values())
         combinations = list(product(*values))
         total = len(combinations)
-        print(f"参数优化: {total} 种组合 × {self.strategy_name} × {self.symbol}")
+        print(f"参数优化 (Grid): {total} 种组合 × {self.strategy_name} × {self.symbol}")
         print(f"优化指标: {OPTIMIZE_METRICS.get(self.metric, self.metric)}")
         if self.risk_params and self.risk_params.get("enabled"):
             print(f"风控: 已启用")
@@ -153,6 +241,88 @@ class StrategyOptimizer:
             for combo in combinations
         ]
 
+        all_results = self._run_concurrent(args_list, total)
+        return self._summarize(all_results)
+
+    def _optimize_search(
+        self,
+        param_grid: dict[str, list | tuple],
+        method: OptimizeMethod,
+        n_trials: int = 50,
+        n_jobs: int | None = None,
+    ) -> dict[str, Any]:
+        """随机/贝叶斯搜索（optuna 驱动）。"""
+        try:
+            import optuna
+        except ImportError:
+            raise ImportError(
+                "随机/贝叶斯优化需要 optuna：pip install optuna"
+            )
+
+        n_jobs = n_jobs or self.workers
+        print(
+            f"参数优化 ({method.value}): {n_trials} trials × {self.strategy_name} × {self.symbol}"
+        )
+        print(f"优化指标: {OPTIMIZE_METRICS.get(self.metric, self.metric)}")
+        print(f"并发: {n_jobs} workers")
+
+        # 把 param_grid 转成 optuna 建议器
+        suggesters = {}
+        for name, values in param_grid.items():
+            suggesters[name] = _make_suggester(name, values, method)
+
+        # 用 optuna 串行驱动 trial（每次 trial 内部开 1 个进程跑回测）
+        # 注意：optuna 自带 n_jobs，但子进程嵌套进程会复杂；这里用串行 trial + 内部并发
+        higher_better = _is_higher_better(self.metric)
+        all_results: list[dict] = []
+
+        def _objective(trial: "optuna.Trial") -> float:
+            params = {name: suggest(trial) for name, suggest in suggesters.items()}
+            args_tuple = (
+                self.strategy_name,
+                self.symbol,
+                self.days,
+                self.commission,
+                self.stop_loss,
+                self.take_profit,
+                self.position_size,
+                self.start_date,
+                self.end_date,
+                params,
+                self.risk_params,
+            )
+            # 单次回测在子进程跑（_run_single_backtest 是模块级函数）
+            with ProcessPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_run_single_backtest, args_tuple)
+                result = future.result()
+            result["params"] = params
+            all_results.append(result)
+
+            score = result.get(self.metric, None)
+            if score is None or "error" in result:
+                raise optuna.TrialPruned()  # optuna 跳过该 trial
+
+            # optuna 始终最大化
+            return float(score) if higher_better else -float(score)
+
+        sampler = (
+            optuna.samplers.TPESampler(seed=42) if method == OptimizeMethod.BAYESIAN
+            else optuna.samplers.RandomSampler(seed=42)
+        )
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        # 静默 optuna 日志
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study.optimize(_objective, n_trials=n_trials, show_progress_bar=False)
+
+        # 标准化结果
+        valid = [r for r in all_results if "error" not in r]
+        summary = self._summarize(all_results)
+        summary["n_trials"] = len(all_results)
+        summary["n_pruned"] = len(all_results) - len(valid)
+        return summary
+
+    def _run_concurrent(self, args_list: list, total: int) -> list[dict]:
+        """并发跑 args_list 里的回测，实时打印进度。"""
         all_results = []
         with ProcessPoolExecutor(max_workers=self.workers) as executor:
             futures = {executor.submit(_run_single_backtest, args): args for args in args_list}
@@ -168,18 +338,18 @@ class StrategyOptimizer:
                     args = futures[future]
                     all_results.append({"params": args[-1], "error": str(e)})
                     print(f"  [{i}/{total}] {args[-1]} → ERROR: {e}")
+        return all_results
 
-        # 找最优（对于 max_drawdown_pct 越小越好）
+    def _summarize(self, all_results: list[dict]) -> dict[str, Any]:
+        """从结果里挑最优 + 打印。"""
         valid_results = [r for r in all_results if "error" not in r]
         if not valid_results:
             print("没有有效的回测结果")
             return {"best_params": {}, "best_score": None, "all_results": all_results}
 
-        if self.metric in ("max_drawdown_pct",):
-            # 越小越好
+        if self.metric in _LOWER_IS_BETTER:
             best = min(valid_results, key=lambda r: r.get(self.metric, float("inf")))
         else:
-            # 越大越好
             best = max(valid_results, key=lambda r: r.get(self.metric, float("-inf")))
 
         best_score = best.get(self.metric, None)

@@ -10,6 +10,8 @@ import yaml
 
 from backtest.engine import BacktestEngine
 from backtest.output import (
+    export_csv,
+    export_json,
     export_summary_json,
     export_trades_csv,
     plot_drawdown_curve,
@@ -17,8 +19,14 @@ from backtest.output import (
     plot_monthly_heatmap,
     plot_strategy_comparison,
 )
+from config.loader import (
+    detect_format as _detect_config_format,
+    load_config as _load_user_config,
+    merge_config_with_args as _merge_user_config,
+)
 from backtest.portfolio import PortfolioBacktestEngine
 from backtest.optimizer import StrategyOptimizer, DEFAULT_GRIDS, OPTIMIZE_METRICS
+from backtest.multi_strategy import MultiStrategyEngine
 from backtest.walk_forward import WalkForwardValidator
 from broker.simulator import SimulatorBroker
 from data.fetcher import DataFetcher
@@ -30,7 +38,7 @@ from utils.logger import setup_logger
 
 def _run_single_backtest(args_tuple):
     """独立函数，用于并发回测（必须是模块级以支持 pickle）。"""
-    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params = args_tuple
+    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params, frequency = args_tuple
     strategy_cls = get_strategy_class(strategy_name)
     if strategy_cls is None:
         strategy_cls = get_strategy_class("sma")
@@ -66,6 +74,7 @@ def _run_single_backtest(args_tuple):
         days=days,
         start_date=start_date,
         end_date=end_date,
+        frequency=frequency,
     )
     if summary is None:
         return None
@@ -185,6 +194,17 @@ def export_results(args, summary: dict, symbol: str):
     if args.output_csv:
         export_trades_csv(trades, args.output_csv)
 
+    if getattr(args, "output_html", None):
+        from backtest.output import export_html_report
+        html_path = Path(args.output_html)
+        if html_path.is_dir() or str(args.output_html).endswith("/"):
+            html_path = html_path / f"{symbol}_report.html"
+        export_html_report(
+            summary,
+            html_path,
+            trades=trades if not args.no_html_trades else None,
+        )
+
     if args.chart:
         chart_dir = Path(args.chart)
         equity_path = chart_dir / f"{symbol}_equity.png"
@@ -258,7 +278,11 @@ def run_optimize(args, config, logger):
         risk_params=risk_params,
     )
 
-    result = optimizer.optimize(param_grid)
+    result = optimizer.optimize(
+        param_grid,
+        method=args.optimize_method,
+        n_trials=args.optimize_trials or 50,
+    )
     if result["all_results"]:
         optimizer.print_leaderboard(result["all_results"], top=args.optimize_top or 10)
 
@@ -390,7 +414,7 @@ def run_backtest(args, config, logger):
         tasks = []
         for symbol in symbols:
             for s in strategy_names:
-                tasks.append((s, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params))
+                tasks.append((s, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params, getattr(args, "frequency", "day")))
 
         print(f"\n{'=' * 60}")
         print(f"批量回测: {len(symbols)} 只股票 x {len(strategy_names)} 种策略 = {len(tasks)} 个任务 (并发执行)")
@@ -545,6 +569,7 @@ def run_backtest(args, config, logger):
                 days=days,
                 start_date=start_date,
                 end_date=end_date,
+                frequency=getattr(args, "frequency", "day"),
             )
             if summary is None:
                 continue
@@ -648,6 +673,97 @@ def run_realtime(args, config, logger):
         monitor.stop()
 
 
+def run_multi_strategy(args, config, logger):
+    """运行多策略并行组合回测。
+
+    用法：
+        python main.py --mode multi_strategy --symbol 000001.SZ \\
+            --strategies sma,rsi,bollinger --weights 0.4,0.3,0.3
+    """
+    backtest_config = config.get("backtest", {})
+
+    # 解析 --strategies
+    if not args.strategies:
+        logger.error("--strategies 必填（多策略组合），如 --strategies sma,rsi,bollinger")
+        return
+    strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    if not strategies:
+        logger.error("策略列表为空")
+        return
+
+    # 解析 --weights
+    weights = None
+    if args.weights:
+        try:
+            weights = [float(w.strip()) for w in args.weights.split(",") if w.strip()]
+        except ValueError as e:
+            logger.error("权重解析失败: %s", e)
+            return
+        if len(weights) != len(strategies):
+            logger.error("权重数量 %d 与策略数量 %d 不匹配", len(weights), len(strategies))
+            return
+
+    if not args.symbol:
+        logger.error("--symbol 必填")
+        return
+
+    days = args.days or backtest_config.get("days", 250)
+    initial_cash = backtest_config.get("initial_cash", 1_000_000)
+    commission = backtest_config.get("commission", 0.0003)
+    position_size = args.position_size if args.position_size is not None else 1.0
+    stop_loss = args.stop_loss or 0.0
+    take_profit = args.take_profit or 0.0
+
+    engine = MultiStrategyEngine(
+        strategies=strategies,
+        symbol=args.symbol,
+        days=days,
+        initial_cash=initial_cash,
+        commission=commission,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        position_size=position_size,
+        weights=weights,
+        start_date=getattr(args, "start_date", None),
+        end_date=getattr(args, "end_date", None),
+    )
+    result = engine.run()
+
+    # 导出（如果有）
+    if getattr(args, "output_json", None):
+        from backtest.output import export_summary_json
+        combined = result.get("combined", {})
+        export_summary_json(
+            combined,
+            combined.get("equity_curve", []),
+            [],
+            args.output_json,
+        )
+
+    if getattr(args, "output_html", None):
+        from backtest.output import export_html_comparison
+        rows = []
+        for r in result.get("strategies", []):
+            if "error" not in r:
+                rows.append(r)
+        rows.append({
+            "strategy": "【组合】",
+            "symbol": args.symbol,
+            "profit_pct": result["combined"].get("profit_pct", 0),
+            "annual_return": result["combined"].get("annual_return", 0),
+            "sharpe_ratio": result["combined"].get("sharpe_ratio", 0),
+            "max_drawdown_pct": result["combined"].get("max_drawdown_pct", 0),
+            "win_rate": result["combined"].get("win_rate", 0),
+            "trades": result["combined"].get("trades", 0),
+            "profit_factor": result["combined"].get("profit_factor", 0),
+        })
+        from pathlib import Path
+        html_path = Path(args.output_html)
+        if html_path.is_dir() or str(args.output_html).endswith("/"):
+            html_path = html_path / f"{args.symbol}_multi_strategy.html"
+        export_html_comparison(rows, html_path, title=f"{args.symbol} · 多策略组合")
+
+
 def run_walk_forward(args, config, logger):
     """运行 Walk-Forward 验证。"""
     backtest_config = config.get("backtest", {})
@@ -725,15 +841,41 @@ def run_walk_forward(args, config, logger):
 def main():
     parser = argparse.ArgumentParser(description="量化交易系统")
     parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="YAML/JSON 配置预设文件（CLI 参数会覆盖 YAML 字段）",
+    )
+    parser.add_argument(
+        "--save-config",
+        metavar="PATH",
+        help="把当前 CLI 参数保存为 YAML 配置预设（方便复用）",
+    )
+    parser.add_argument(
         "--mode",
-        choices=["backtest", "simulate", "realtime", "optimize", "walkforward"],
+        choices=["backtest", "simulate", "realtime", "optimize", "walkforward", "multi_strategy"],
         default="backtest",
-        help="运行模式",
+        help="运行模式（新增 multi_strategy：多策略并行组合）",
     )
     parser.add_argument("--strategy", default=DEFAULT_STRATEGY, help="策略名称")
+    parser.add_argument(
+        "--strategies",
+        metavar="S1,S2,...",
+        help="多策略组合（多策略并行），逗号分隔，如 --strategies sma,rsi,bollinger",
+    )
+    parser.add_argument(
+        "--weights",
+        metavar="W1,W2,...",
+        help="多策略权重（总和=1），如 --weights 0.4,0.3,0.3；默认等分",
+    )
     parser.add_argument("--symbol", default=None, help="股票代码")
     parser.add_argument("--symbols", default=None, help="股票代码文件路径")
     parser.add_argument("--days", type=int, default=None, help="回测天数，默认使用配置值")
+    parser.add_argument(
+        "--frequency",
+        choices=["day", "m1", "m5", "m15", "m30", "m60"],
+        default="day",
+        help="K线频率：day/日 m1=1分 m5=5分 m15 m30 m60（默认 day）",
+    )
     parser.add_argument("--verbose", action="store_true", help="显示交易明细")
     parser.add_argument("--all-strategies", action="store_true", help="测试所有策略并对比")
     parser.add_argument("--stop-loss", type=float, default=None, help="止损比例 (如 0.05 表示 5%%)")
@@ -746,6 +888,8 @@ def main():
     parser.add_argument("--no-parallel", dest="parallel", action="store_false", help="禁用并发批量回测")
     parser.add_argument("--output-json", metavar="PATH", help="导出回测结果为 JSON 文件")
     parser.add_argument("--output-csv", metavar="PATH", help="导出交易记录为 CSV 文件")
+    parser.add_argument("--output-html", metavar="PATH", help="导出单文件 HTML 报告（自包含：CSS + base64 图表）")
+    parser.add_argument("--no-html-trades", action="store_true", help="HTML 报告不含交易明细表（文件更小）")
     parser.add_argument("--chart", metavar="DIR", help="保存权益曲线图到指定目录")
     parser.add_argument("--portfolio", action="store_true", help="启用组合回测模式（多股票同时持仓）")
     parser.add_argument("--max-positions", type=int, default=5, help="组合最大同时持仓数（默认5）")
@@ -753,6 +897,18 @@ def main():
     parser.add_argument("--optimize-metric", default="sharpe_ratio", choices=["profit_pct", "sharpe_ratio", "profit_factor", "max_drawdown_pct", "win_rate"], help="优化目标指标")
     parser.add_argument("--optimize-top", type=int, default=10, help="排行榜显示前N名（默认10）")
     parser.add_argument("--optimize-workers", type=int, default=4, help="并发进程数（默认4）")
+    parser.add_argument(
+        "--optimize-method",
+        default="grid",
+        choices=["grid", "random", "bayesian"],
+        help="优化方法：grid 暴力 / random 随机 / bayesian 贝叶斯（TPE）",
+    )
+    parser.add_argument(
+        "--optimize-trials",
+        type=int,
+        default=50,
+        help="random/bayesian 模式采样次数（grid 模式忽略）",
+    )
     parser.add_argument("--load-params", action="store_true", help="加载已保存的最优参数（回测时自动加载 params/ 目录下对应参数）")
 
     risk_group = parser.add_argument_group("风控参数")
@@ -773,6 +929,28 @@ def main():
     logger = setup_logger()
     config = load_config()
 
+    # --save-config: 先把当前 args 存到 YAML
+    if getattr(args, "save_config", None):
+        from config.loader import save_args_as_config
+        saved = save_args_as_config(args, args.save_config)
+        print(f"配置已保存: {saved}")
+        # 如果用户只 --save-config 不实际跑任务，就退出
+        if not (args.symbol or args.symbols or args.mode != "backtest"):
+            return
+
+    # --config: 把 YAML 配置合并到 args（CLI 已设置的优先）
+    if getattr(args, "config", None):
+        try:
+            user_cfg = _load_user_config(args.config)
+        except (FileNotFoundError, ValueError) as e:
+            logger.error("配置加载失败: %s", e)
+            return
+        except ImportError as e:
+            logger.error("%s", e)
+            return
+        logger.info("加载配置: %s (共 %d 字段)", args.config, len(user_cfg))
+        args = _merge_user_config(user_cfg, args)
+
     if args.mode == "backtest":
         if args.portfolio:
             run_portfolio(args, config, logger)
@@ -786,6 +964,8 @@ def main():
         run_optimize(args, config, logger)
     elif args.mode == "walkforward":
         run_walk_forward(args, config, logger)
+    elif args.mode == "multi_strategy":
+        run_multi_strategy(args, config, logger)
 
 
 if __name__ == "__main__":

@@ -69,11 +69,24 @@ class DataFetcher:
             return f"{code}.{suffix}"
         return symbol
 
-    def get_history(self, symbol: str, days: int = 250) -> pd.DataFrame:
+    # 支持的频率：日线 + 腾讯的 5 种分钟（m1=1分, m5=5分, m15, m30, m60）
+    SUPPORTED_FREQUENCIES = ("day", "m1", "m5", "m15", "m30", "m60")
+
+    def get_history(self, symbol: str, days: int = 250, frequency: str = "day") -> pd.DataFrame:
+        """获取历史 K 线。
+
+        Args:
+            symbol: 标准代码 000001.SZ
+            days: 天数（minute 数据最多 ~5 个交易日）
+            frequency: 'day' / 'm1' / 'm5' / 'm15' / 'm30' / 'm60'
+        """
         if days <= 0:
             raise ValueError("days 必须大于 0")
+        if frequency not in self.SUPPORTED_FREQUENCIES:
+            raise ValueError(f"不支持的频率 {frequency!r}，可选: {self.SUPPORTED_FREQUENCIES}")
 
-        cache_key = f"{symbol}_{days}"
+        # 缓存 key 把 frequency 算进去（分钟线和日线互不干扰）
+        cache_key = f"{symbol}_{days}_{frequency}"
         now = time.time()
         # 读锁：检查缓存是否命中
         with self._cache_lock:
@@ -83,7 +96,8 @@ class DataFetcher:
             if now - cached_time < self._CACHE_TTL:
                 return cached_df.copy()
 
-        if self._local_cache is not None:
+        if self._local_cache is not None and frequency == "day":
+            # 本地缓存只存日线（分钟数据量太大）
             df = self._try_incremental_fetch(symbol, days)
             if not df.empty and len(df) >= days * 0.6:
                 self._local_cache.save(symbol, df)
@@ -92,7 +106,7 @@ class DataFetcher:
                     self._trim_cache()
                 return df
 
-        if BAOSTOCK_AVAILABLE:
+        if BAOSTOCK_AVAILABLE and frequency == "day":
             try:
                 df = self._fetch_from_baostock(symbol, days)
                 if not df.empty and len(df) >= days * 0.6:
@@ -107,10 +121,8 @@ class DataFetcher:
 
         tx_symbol = self._to_tencent_symbol(symbol)
         try:
-            df = self._fetch_from_tencent(tx_symbol, days)
-            if not df.empty and len(df) >= days * 0.7:
-                if self._local_cache is not None:
-                    self._local_cache.save(symbol, df)
+            df = self._fetch_from_tencent(tx_symbol, days, frequency=frequency)
+            if not df.empty:
                 with self._cache_lock:
                     self._history_cache[cache_key] = (df.copy(), now)
                     self._trim_cache()
@@ -118,7 +130,7 @@ class DataFetcher:
         except Exception as exc:
             logger.warning("腾讯API获取失败: %s", exc)
 
-        if self._local_cache is not None:
+        if self._local_cache is not None and frequency == "day":
             df = self._local_cache.load(symbol)
             if not df.empty:
                 logger.info("使用本地缓存数据: %s (%d条)", symbol, len(df))
@@ -242,10 +254,18 @@ class DataFetcher:
         alt_exchange = "SH" if exchange.upper() == "SZ" else "SZ"
         return f"{code_part}.{alt_exchange}"
 
-    def _fetch_from_tencent(self, symbol: str, days: int) -> pd.DataFrame:
+    def _fetch_from_tencent(self, symbol: str, days: int, frequency: str = "day") -> pd.DataFrame:
+        """从腾讯 API 拉数据。
+
+        Args:
+            symbol: 腾讯格式代码（sz000001 / sh600000）
+            days: 拉取天数（用于 start_date 反推）
+            frequency: 'day' / 'm1' / 'm5' / 'm15' / 'm30' / 'm60'
+                注意腾讯 API 的分钟数据最多只能查最近 ~5 个交易日。
+        """
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        params = {"param": f"{symbol},day,{start_date},{end_date},{days},qfq"}
+        params = {"param": f"{symbol},{frequency},{start_date},{end_date},{days},qfq"}
 
         max_retries = 3
         last_exc = None
@@ -265,7 +285,12 @@ class DataFetcher:
 
                 code = next(iter(data_map))
                 code_payload = data_map.get(code) or {}
-                day_data = code_payload.get("qfqday") or code_payload.get("day") or []
+                # 日线用 qfqday/day，分钟用 m{1,5,15,30,60}
+                if frequency == "day":
+                    day_data = code_payload.get("qfqday") or code_payload.get("day") or []
+                else:
+                    key = f"qfq{frequency}" if f"qfq{frequency}" in code_payload else frequency
+                    day_data = code_payload.get(key) or []
                 if not day_data:
                     return pd.DataFrame()
 

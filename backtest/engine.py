@@ -54,16 +54,28 @@ class BacktestEngine(BaseBacktestEngine):
         days: int = 250,
         start_date: str | None = None,
         end_date: str | None = None,
+        frequency: str = "day",
     ) -> dict | None:
+        """运行回测。
+
+        Args:
+            strategy: 策略实例
+            symbol: 股票代码
+            days: 回测天数
+            start_date / end_date: 日期范围过滤
+            frequency: 'day' (默认) / 'm1'/'m5'/'m15'/'m30'/'m60'
+                分钟级回测时 T+1 约束自动失效（同一根 bar 即可买卖）。
+        """
         fetcher = DataFetcher()
         processor = DataProcessor()
 
-        df = fetcher.get_history(symbol, days=days)
+        df = fetcher.get_history(symbol, days=days, frequency=frequency)
         if df.empty:
             print(f"无法获取 {symbol} 数据")
             return None
 
         df = processor.clean(df)
+        # 分钟数据不需要 MA60/MA5 等长周期指标；用通用 add_all_indicators 即可
         df = DataProcessor.add_all_indicators(df)
 
         if start_date:
@@ -77,11 +89,34 @@ class BacktestEngine(BaseBacktestEngine):
             print(f"指定日期范围内无数据: {start_date} ~ {end_date}")
             return None
 
-        print(f"回测开始: {symbol}, 数据量: {len(df)}")
+        # 分钟级：禁用 T+1（同一根 bar 即可成交）和涨跌停（分钟内连续交易规则不同）
+        enforce_t1 = self.enforce_t_plus_1
+        check_limit = self.check_limit
+        if frequency != "day":
+            enforce_t1 = False
+            check_limit = False
+            print(f"分钟级回测 ({frequency}): 自动禁用 T+1 和涨跌停检查")
 
-        return self._run_with_data(strategy, df, symbol)
+        print(f"回测开始: {symbol}, 数据量: {len(df)}, 频率: {frequency}")
 
-    def _run_with_data(self, strategy, df: pd.DataFrame, symbol: str) -> dict | None:
+        return self._run_with_data(
+            strategy, df, symbol, enforce_t1=enforce_t1, check_limit=check_limit
+        )
+
+    def _run_with_data(
+        self,
+        strategy,
+        df: pd.DataFrame,
+        symbol: str,
+        enforce_t1: bool | None = None,
+        check_limit: bool | None = None,
+    ) -> dict | None:
+        # 允许调用方临时覆盖 T+1 / 涨跌停
+        if enforce_t1 is not None:
+            self.enforce_t_plus_1 = enforce_t1
+        if check_limit is not None:
+            self.check_limit = check_limit
+
         self.reset()
 
         strategy.on_init({"symbol": symbol, "days": len(df)})

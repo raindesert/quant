@@ -22,7 +22,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # 极简 stub：仅在真实库不可用时安装。如果真实库已 import，绝不覆盖 sys.modules
 # （避免污染同一进程后续测试）。
 def _is_real_lib_available(name):
-    """检查真实库是否已经在 sys.modules 中且是合法的（非 stub）模块。"""
+    """检查真实库是否已经在 sys.modules 中且是合法的（非 stub）模块。
+
+    注意：只看 sys.modules 是不够的，因为：
+    - 真库没 import 时 sys.modules[name] 是 None（但库本身装在磁盘上）
+    - 这种情况下应该可以安全 import 真库再用
+    但当前策略是：如果 sys.modules 里有真库，就不装 stub；
+    如果 sys.modules 里有 stub，就保留 stub（不重复装）。
+    """
     mod = sys.modules.get(name)
     if mod is None:
         return False
@@ -30,6 +37,16 @@ def _is_real_lib_available(name):
     if getattr(mod, "__file__", None) is None and not getattr(mod, "__loader__", None):
         return False
     return True
+
+
+def _can_import_real(name: str) -> bool:
+    """检查真实库能否被 import（不实际 import，只查 spec）。"""
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec(name)
+        return spec is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _install_pandas_stub():
@@ -148,8 +165,16 @@ def _install_matplotlib_stub():
 
 
 def _install_yaml_stub():
+    # 关键修复：test_optimization_fixes 顶层被 import 时，yaml 真实库可能没在
+    # sys.modules 中（_is_real_lib_available 返回 False），但真实库装在磁盘上。
+    # 此时应该用真实库而不是装 stub，否则会污染同进程后续 test_config_loader。
     if _is_real_lib_available("yaml"):
         return
+    if _can_import_real("yaml"):
+        # 真实库可 import，主动加载进 sys.modules
+        import yaml
+        return
+    # 真实库不可用（无 PyYAML），才装 stub
     y = types.ModuleType("yaml")
     y.safe_load = lambda x: {}
     sys.modules["yaml"] = y
