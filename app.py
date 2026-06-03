@@ -2905,6 +2905,8 @@ def _render_batch_backtest_section(stocks: list[dict]):
         st.warning("请至少选一只股票")
         return
 
+    # 进度条 — on_progress 回调每完成一只就更新 (修 v36 bug: 之前 progress 永远不动)
+    total_n = len(sel_syms)
     progress = st.progress(0)
     status = st.empty()
 
@@ -2917,8 +2919,15 @@ def _render_batch_backtest_section(stocks: list[dict]):
             position_size=position_size,
         )
 
-    # 进度条模拟（实际并发，不可预知每个完成时间）
-    status.text(f"⏳ 开始并发回测 {len(sel_syms)} 只股票...")
+    status.text(f"⏳ 开始并发回测 {total_n} 只股票...")
+
+    def _on_progress(done: int, total: int, sym: str, result: dict) -> None:
+        """每次有 worker 完成时被 batch_backtest 调一次。"""
+        progress.progress(done / total)
+        if "error" in result:
+            status.text(f"❌ {sym} 失败: {result['error']} ({done}/{total})")
+        else:
+            status.text(f"✅ {sym} 完成 ({done}/{total})")
 
     try:
         results = batch_backtest(
@@ -2929,13 +2938,13 @@ def _render_batch_backtest_section(stocks: list[dict]):
             take_profit=take_profit,
             position_size=position_size,
             engine_factory=_engine_factory,
+            on_progress=_on_progress,
         )
     except Exception as exc:
         st.error(f"批量回测失败: {exc}")
         return
 
-    progress.progress(100)
-    status.text("✅ 完成")
+    status.text(f"✅ 完成 {total_n}/{total_n}")
 
     # 排序
     ranked = rank_batch_results(results, metric="profit_pct", descending=True)

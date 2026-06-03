@@ -234,6 +234,7 @@ def batch_backtest(
     take_profit: float = 0.0,
     position_size: float = 1.0,
     engine_factory=None,
+    on_progress=None,
 ) -> list[dict]:
     """快速批量回测：依次对 N 只自选股票跑同一策略，返回 summary 列表。
 
@@ -246,6 +247,9 @@ def batch_backtest(
         engine_factory: 工厂函数 (symbol) -> BacktestEngine 实例。
             默认 lambda: BacktestEngine(initial_cash=..., commission=..., ...)，
             测试可注入 fake engine 避免真实网络请求。
+        on_progress: 可选回调，每次有 worker 完成时调用
+            on_progress(done: int, total: int, symbol: str, result: dict)
+            — 可用于 streamlit st.progress() 实时更新进度条。
 
     Returns:
         list of dict，每个 dict = {"symbol", "strategy", "summary"} 或
@@ -280,6 +284,7 @@ def batch_backtest(
         return []
 
     results = []
+    total = len(symbols)
     with ThreadPoolExecutor(max_workers=min(4, len(symbols))) as pool:
         futures = {pool.submit(_run_one, sym): sym for sym in symbols}
         for fut in as_completed(futures):
@@ -289,6 +294,13 @@ def batch_backtest(
             except Exception as exc:
                 r = {"symbol": sym, "strategy": strategy_name, "error": str(exc)}
             results.append(r)
+            # 实时通知 (供 streamlit progress 回调使用)
+            if on_progress is not None:
+                try:
+                    on_progress(len(results), total, sym, r)
+                except Exception:
+                    # callback 内部错误不能影响主流程
+                    pass
 
     # 按输入顺序排序
     sym_to_result = {r["symbol"]: r for r in results}

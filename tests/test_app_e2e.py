@@ -637,6 +637,79 @@ class TestWatchlist(unittest.TestCase):
         statuses = ["error" in r for r in results]
         self.assertNotEqual(statuses[0], statuses[1])
 
+    def test_batch_backtest_on_progress_called_per_completion(self):
+        """回归测试 v36: on_progress 回调必须每完成一只就调一次 (修 progress 永远不动的 bug)."""
+        from utils.watchlist import batch_backtest
+        import time
+
+        class SlowEngine:
+            """每只 sleep 0.05s, 确保并发真触发多次回调 (而非全跑完才一次性回调)."""
+            def __init__(self, **kw): pass
+            def run(self, strategy, symbol, days=250):
+                time.sleep(0.05)
+                return {"profit_pct": 1.0, "sharpe_ratio": 0.5, "max_drawdown_pct": -1.0,
+                        "win_rate": 50.0, "trades": 1, "final_value": 1010000}
+
+        calls = []
+        def cb(done, total, sym, result):
+            calls.append((done, total, sym))
+
+        # 5 只, max_workers=4 (按 symbols 数量 min)
+        results = batch_backtest(
+            ["A", "B", "C", "D", "E"],
+            engine_factory=SlowEngine,
+            on_progress=cb,
+        )
+        # 必须调 5 次 (每只一次)
+        self.assertEqual(len(calls), 5, f"on_progress 应被调 5 次, 实际 {len(calls)} 次")
+        # done 从 1 单调递增到 5
+        dones = [c[0] for c in calls]
+        self.assertEqual(dones, [1, 2, 3, 4, 5])
+        # total 始终 = 5
+        totals = set(c[1] for c in calls)
+        self.assertEqual(totals, {5})
+        # 每只都收到了
+        syms = sorted(c[2] for c in calls)
+        self.assertEqual(syms, ["A", "B", "C", "D", "E"])
+        # 全部结果成功
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all("summary" in r for r in results))
+
+    def test_batch_backtest_on_progress_exception_does_not_break(self):
+        """on_progress 内部抛错不能影响主流程 (防御性)."""
+        from utils.watchlist import batch_backtest
+
+        class OkEngine:
+            def __init__(self, **kw): pass
+            def run(self, strategy, symbol, days=250):
+                return {"profit_pct": 1.0}
+
+        def bad_cb(done, total, sym, result):
+            raise RuntimeError("callback boom")
+
+        # 不会向上抛
+        results = batch_backtest(
+            ["A", "B"],
+            engine_factory=OkEngine,
+            on_progress=bad_cb,
+        )
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all("summary" in r for r in results))
+
+    def test_batch_backtest_no_on_progress_backward_compat(self):
+        """不传 on_progress 时行为不变 (向后兼容旧调用方)."""
+        from utils.watchlist import batch_backtest
+
+        class OkEngine:
+            def __init__(self, **kw): pass
+            def run(self, strategy, symbol, days=250):
+                return {"profit_pct": 1.0}
+
+        # 不传 on_progress — 不应崩
+        results = batch_backtest(["A", "B"], engine_factory=OkEngine)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all("summary" in r for r in results))
+
     def test_rank_batch_by_profit_desc(self):
         from utils.watchlist import rank_batch_results
         results = [
