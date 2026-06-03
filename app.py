@@ -1311,6 +1311,127 @@ def _render_quote_detail(quote: dict):
             _fetch_realtime_batch.clear()
             st.rerun()
 
+    # ============== 历史 K 线图表 (v22 新增) ==============
+    st.markdown("---")
+    st.subheader("📈 历史 K 线")
+    _render_kline_section(sym, key_prefix="rt_detail_kl")
+
+
+@st.cache_data(ttl=1800, show_spinner="加载 K 线...")
+def _fetch_kline_cached(symbol: str, days: int, frequency: str = "day"):
+    """缓存 K 线数据（30 分钟 TTL）。"""
+    fetcher = DataFetcher()
+    return fetcher.get_history(symbol, days=days, frequency=frequency)
+
+
+def _render_kline_section(symbol: str, key_prefix: str = ""):
+    """渲染 K 线图表 section：频率选择 + 蜡烛 + MA + 成交量。"""
+    if not symbol:
+        st.info("请先选择股票")
+        return
+
+    # 频率选择 + 天数
+    col1, col2, col3 = st.columns([1, 1, 2])
+    freq_label_map = {
+        "day": "日线", "m1": "1分", "m5": "5分",
+        "m15": "15分", "m30": "30分", "m60": "60分",
+    }
+    with col1:
+        freq = st.selectbox(
+            "频率",
+            ["day", "m60", "m30", "m15", "m5", "m1"],
+            index=0,
+            format_func=lambda x: freq_label_map.get(x) or x,
+            key=f"{key_prefix}_freq",
+        )
+    with col2:
+        # 频率对应最大天数
+        max_days = {"day": 1500, "m60": 30, "m30": 30, "m15": 15, "m5": 10, "m1": 5}
+        days = st.number_input(
+            "天数", 5, max_days.get(freq, 500),
+            min(120, max_days.get(freq, 120)),
+            key=f"{key_prefix}_days",
+        )
+    with col3:
+        # MA 周期
+        ma_periods_text = st.text_input(
+            "MA 周期 (逗号分隔)", value="5,10,20,60",
+            key=f"{key_prefix}_ma",
+            help="例: 5,10,20,60",
+        )
+        try:
+            ma_periods = [int(x.strip()) for x in ma_periods_text.split(",") if x.strip().isdigit()]
+            if not ma_periods:
+                ma_periods = [5, 10, 20, 60]
+        except Exception:
+            ma_periods = [5, 10, 20, 60]
+
+    # 拉数据
+    try:
+        df = _fetch_kline_cached(symbol, days=days, frequency=freq)
+    except Exception as exc:
+        st.error(f"❌ K 线数据获取失败: {exc}")
+        return
+
+    if df is None or len(df) == 0:
+        st.warning(f"⚠️ {symbol} 在 {freq} 频率下无数据")
+        return
+
+    # 验证必需列
+    required = {"open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        st.error(f"数据缺列: {missing}")
+        return
+
+    # 计算 MA
+    for p in ma_periods:
+        df[f"ma{p}"] = df["close"].rolling(window=p, min_periods=1).mean()
+
+    # 画图
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.7, 0.3],
+        vertical_spacing=0.03,
+    )
+    # K 线
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="K线",
+        increasing_line_color="#d32f2f", decreasing_line_color="#388e3c",
+    ), row=1, col=1)
+    # MA 线
+    ma_colors = ["#FFA726", "#29B6F6", "#AB47BC", "#66BB6A", "#FFCA28", "#26C6DA"]
+    for i, p in enumerate(ma_periods):
+        if f"ma{p}" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[f"ma{p}"], name=f"MA{p}",
+                line=dict(width=1.2, color=ma_colors[i % len(ma_colors)]),
+            ), row=1, col=1)
+    # 成交量
+    colors = ["#d32f2f" if c >= o else "#388e3c" for c, o in zip(df["close"], df["open"])]
+    fig.add_trace(go.Bar(
+        x=df.index, y=df["volume"], name="成交量",
+        marker_color=colors, showlegend=False,
+    ), row=2, col=1)
+
+    fig.update_layout(
+        height=550,
+        title=f"{symbol} K线 ({freq}, {len(df)} bar)",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", y=1.02),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(title_text="日期", row=2, col=1)
+    fig.update_yaxes(title_text="价格", row=1, col=1)
+    fig.update_yaxes(title_text="成交量", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 简表
+    with st.expander("📋 原始数据", expanded=False):
+        st.dataframe(df.tail(20), use_container_width=True)
+
 
 def page_history():
     """回测历史 — 表格/趋势图/加载/导出。"""
@@ -1613,6 +1734,38 @@ def page_watchlist():
                 n = import_csv(pasted)
                 st.success(f"导入 {n} 个新股票")
                 st.rerun()
+
+    # ============== 历史 K 线 (v22 新增) ==============
+    # 注意：page_watchlist 在 line 1624 已 return（空自选），所以此处 stocks 必有
+    enabled = [s for s in stocks if s.get("enabled", True)]
+    if enabled:
+        st.markdown("---")
+        st.subheader("📈 单只 K 线")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            sym_options = [s["symbol"] for s in enabled]
+            sym_labels = [
+                f"{s['symbol']} — {s.get('name', '') or '无'}" for s in enabled
+            ]
+            default_idx = 0
+            cur = st.session_state.get("global_symbol", "")
+            if cur in sym_options:
+                default_idx = sym_options.index(cur)
+            kline_sym = st.selectbox(
+                "选股票", options=sym_options,
+                index=default_idx,
+                format_func=lambda x: dict(zip(sym_options, sym_labels)).get(x) or x,
+                key="wl_kline_sel",
+                label_visibility="collapsed",
+            )
+        with col2:
+            if kline_sym and st.button("📊 跳到详情页", key="wl_kline_goto",
+                                       use_container_width=True,
+                                       help="切到实时行情页看更多详情"):
+                st.session_state["global_symbol"] = kline_sym
+                st.info(f"已设置 global_symbol={kline_sym}，切到 📡 实时行情 → 🔍 详情")
+        if kline_sym:
+            _render_kline_section(kline_sym, key_prefix="wl_kl")
 
     # ============== 快速批量回测 (v20 新增) ==============
     _render_batch_backtest_section(stocks)

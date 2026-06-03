@@ -629,6 +629,107 @@ class TestWatchlist(unittest.TestCase):
         self.assertEqual([r["symbol"] for r in ranked], ["B", "A"])
 
 
+class TestKlineSection(unittest.TestCase):
+    """测试 _render_kline_section 不抛异常 + 处理各种数据场景。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = _install_fake_streamlit()
+        for mod in list(sys.modules.keys()):
+            if mod == "app" or mod.startswith("app."):
+                del sys.modules[mod]
+        import app  # noqa: F401
+        cls.app = app
+
+    def _fake_df(self, n: int = 60):
+        """构造 fake K 线 DataFrame。"""
+        import pandas as pd
+        import numpy as np
+        idx = pd.date_range("2026-01-01", periods=n, freq="D")
+        return pd.DataFrame({
+            "open": np.linspace(10, 12, n) + np.random.RandomState(0).normal(0, 0.1, n),
+            "high": np.linspace(10, 12, n) + 0.5,
+            "low": np.linspace(10, 12, n) - 0.5,
+            "close": np.linspace(10, 12, n),
+            "volume": np.ones(n) * 1_000_000,
+        }, index=idx)
+
+    def test_kline_empty_symbol(self):
+        """空 symbol → info 提示，不抛异常。"""
+        self.app._render_kline_section("", key_prefix="test_empty")
+
+    def test_kline_full_path_with_fake_data(self):
+        """完整路径：注入 fake df，走 K 线 + MA + 成交量 + 原始数据。"""
+        fake = self._fake_df(60)
+        # monkey-patch _fetch_kline_cached 返 fake df
+        original = self.app._fetch_kline_cached
+        self.app._fetch_kline_cached = lambda *a, **kw: fake
+        try:
+            self.app._render_kline_section("000001.SZ", key_prefix="test_full")
+        finally:
+            self.app._fetch_kline_cached = original
+
+    def test_kline_data_empty(self):
+        """数据为空 → warning，不抛异常。"""
+        import pandas as pd
+        original = self.app._fetch_kline_cached
+        self.app._fetch_kline_cached = lambda *a, **kw: pd.DataFrame()
+        try:
+            self.app._render_kline_section("000001.SZ", key_prefix="test_empty_df")
+        finally:
+            self.app._fetch_kline_cached = original
+
+    def test_kline_data_none(self):
+        """数据为 None → warning，不抛异常。"""
+        original = self.app._fetch_kline_cached
+        self.app._fetch_kline_cached = lambda *a, **kw: None
+        try:
+            self.app._render_kline_section("000001.SZ", key_prefix="test_none")
+        finally:
+            self.app._fetch_kline_cached = original
+
+    def test_kline_missing_columns(self):
+        """数据缺列 → error 提示。"""
+        import pandas as pd
+        bad_df = pd.DataFrame({"open": [1, 2], "close": [1.5, 2.5]})  # 缺 high/low/volume
+        original = self.app._fetch_kline_cached
+        self.app._fetch_kline_cached = lambda *a, **kw: bad_df
+        try:
+            self.app._render_kline_section("000001.SZ", key_prefix="test_missing")
+        finally:
+            self.app._fetch_kline_cached = original
+
+    def test_kline_fetch_exception(self):
+        """数据获取异常 → error，不抛。"""
+        original = self.app._fetch_kline_cached
+        self.app._fetch_kline_cached = lambda *a, **kw: (_ for _ in ()).throw(
+            ConnectionError("network down")
+        )
+        try:
+            self.app._render_kline_section("000001.SZ", key_prefix="test_exc")
+        finally:
+            self.app._fetch_kline_cached = original
+
+    def test_kline_minute_frequency(self):
+        """分钟频率也能跑通。"""
+        import pandas as pd
+        import numpy as np
+        idx = pd.date_range("2026-06-03 09:30", periods=48, freq="5min")
+        fake = pd.DataFrame({
+            "open": np.linspace(10, 11, 48),
+            "high": np.linspace(10, 11, 48) + 0.1,
+            "low": np.linspace(10, 11, 48) - 0.1,
+            "close": np.linspace(10, 11, 48) + 0.05,
+            "volume": np.ones(48) * 100,
+        }, index=idx)
+        original = self.app._fetch_kline_cached
+        self.app._fetch_kline_cached = lambda *a, **kw: fake
+        try:
+            self.app._render_kline_section("000001.SZ", key_prefix="test_m5")
+        finally:
+            self.app._fetch_kline_cached = original
+
+
 class TestAppRouter(unittest.TestCase):
     """验证 _PAGE_ROUTER 字典完整性。"""
 
