@@ -1431,6 +1431,9 @@ def _render_kline_section(symbol: str, key_prefix: str = ""):
     # ============== 技术指标副图 (v25 新增) ==============
     _render_indicator_section(df)
 
+    # ============== 策略信号线 (v29 新增) ==============
+    _render_strategy_overlay_section(df, symbol, freq)
+
     # ============== 买卖点标记 (v26 新增) ==============
     _render_buy_sell_section(df, symbol, freq)
 
@@ -1578,6 +1581,240 @@ def _render_indicator_section(df):
     # 简表
     with st.expander("📋 原始数据", expanded=False):
         st.dataframe(df.tail(20), use_container_width=True)
+
+
+def _render_strategy_overlay_section(df, symbol: str, freq: str):
+    """在 K 线上叠加策略信号 (SMA 通道 / Bollinger 通道 / MA 交叉)。
+
+    - SMA 通道: 快/慢 2 条均线 + 金叉/死叉标记
+    - Bollinger 通道: 上/中/下轨 + 突破点标记
+    - 多种策略可叠加, 自由开关
+    """
+    with st.expander("📐 策略信号线叠加", expanded=False):
+        st.caption("在 K 线上叠加 SMA / Bollinger 等通道线，标记关键交易信号")
+
+        # ============== 参数 ==============
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            show_sma = st.checkbox("SMA 通道", value=True, key="sma_toggle")
+        with col2:
+            show_bb = st.checkbox("Bollinger 通道", value=False, key="bb_toggle")
+        with col3:
+            show_cross = st.checkbox("MA 交叉标记", value=True, key="cross_toggle")
+
+        if not (show_sma or show_bb or show_cross):
+            st.info("请至少勾选一个信号类型")
+            return
+
+        # SMA 周期
+        sma_fast = 5
+        sma_slow = 20
+        if show_sma or show_cross:
+            with st.container():
+                cs1, cs2, cs3 = st.columns(3)
+                with cs1:
+                    sma_fast = st.number_input(
+                        "SMA 快线", 2, 60, 5, 1, key="sma_fast",
+                        help="默认 5",
+                    )
+                with cs2:
+                    sma_slow = st.number_input(
+                        "SMA 慢线", 5, 250, 20, 1, key="sma_slow",
+                        help="默认 20",
+                    )
+                with cs3:
+                    if sma_fast >= sma_slow:
+                        st.warning("⚠️ 快线 ≥ 慢线，交叉不会发生")
+
+        # Bollinger 参数
+        bb_period = 20
+        bb_std = 2.0
+        if show_bb:
+            with st.container():
+                cb1, cb2 = st.columns(2)
+                with cb1:
+                    bb_period = st.number_input("BB 周期", 5, 100, 20, 1, key="bb_period")
+                with cb2:
+                    bb_std = st.number_input("BB 标准差倍数", 0.5, 4.0, 2.0, 0.1,
+                                              key="bb_std", format="%.1f")
+
+        # ============== 画图 ==============
+        fig = _build_strategy_overlay_fig(
+            df, symbol, freq,
+            sma_fast=sma_fast, sma_slow=sma_slow,
+            bb_period=bb_period, bb_std=bb_std,
+            show_sma=show_sma, show_bb=show_bb, show_cross=show_cross,
+        )
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+
+        # 解释 / 摘要
+        _render_overlay_summary(df, sma_fast, sma_slow, bb_period, bb_std,
+                                show_sma, show_bb, show_cross)
+
+
+def _build_strategy_overlay_fig(
+    df, symbol: str, freq: str,
+    sma_fast: int = 5, sma_slow: int = 20,
+    bb_period: int = 20, bb_std: float = 2.0,
+    show_sma: bool = True, show_bb: bool = False, show_cross: bool = True,
+):
+    """构建带策略信号的 K 线图。"""
+    if df is None or len(df) == 0:
+        return None
+
+    fig = go.Figure()
+    # K 线
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="K线",
+        increasing_line_color="#d32f2f", decreasing_line_color="#388e3c",
+    ))
+
+    sma_fast_series = None
+    sma_slow_series = None
+    golden_x, golden_y = [], []
+    death_x, death_y = [], []
+
+    # SMA
+    if show_sma or show_cross:
+        df_sma = DataProcessor.add_ma(df.copy(), periods=[sma_fast, sma_slow])
+        sma_fast_series = df_sma[f"ma{sma_fast}"]
+        sma_slow_series = df_sma[f"ma{sma_slow}"]
+        if show_sma:
+            fig.add_trace(go.Scatter(
+                x=df_sma.index, y=sma_fast_series,
+                name=f"SMA{sma_fast}", line=dict(color="#FFA726", width=1.2),
+            ))
+            fig.add_trace(go.Scatter(
+                x=df_sma.index, y=sma_slow_series,
+                name=f"SMA{sma_slow}", line=dict(color="#29B6F6", width=1.5),
+            ))
+
+        # 找金叉/死叉
+        if show_cross and sma_fast < sma_slow:
+            diff = sma_fast_series - sma_slow_series
+            for i in range(1, len(diff)):
+                if diff.iloc[i - 1] <= 0 and diff.iloc[i] > 0:
+                    golden_x.append(diff.index[i])
+                    golden_y.append(sma_fast_series.iloc[i])
+                elif diff.iloc[i - 1] >= 0 and diff.iloc[i] < 0:
+                    death_x.append(diff.index[i])
+                    death_y.append(sma_fast_series.iloc[i])
+
+            if golden_x:
+                fig.add_trace(go.Scatter(
+                    x=golden_x, y=golden_y, mode="markers",
+                    marker=dict(symbol="triangle-up", size=12, color="#388e3c",
+                                line=dict(color="white", width=1)),
+                    name=f"金叉 ({len(golden_x)})",
+                    hovertemplate="金叉<br>%{x}<br>价: %{y:.2f}<extra></extra>",
+                ))
+            if death_x:
+                fig.add_trace(go.Scatter(
+                    x=death_x, y=death_y, mode="markers",
+                    marker=dict(symbol="triangle-down", size=12, color="#d32f2f",
+                                line=dict(color="white", width=1)),
+                    name=f"死叉 ({len(death_x)})",
+                    hovertemplate="死叉<br>%{x}<br>价: %{y:.2f}<extra></extra>",
+                ))
+
+    # Bollinger
+    if show_bb:
+        df_bb = DataProcessor.add_bollinger(df.copy(), period=bb_period, std=bb_std)
+        fig.add_trace(go.Scatter(
+            x=df_bb.index, y=df_bb["bb_upper"],
+            name=f"BB上轨", line=dict(color="#AB47BC", width=1, dash="dot"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_bb.index, y=df_bb["bb_mid"],
+            name=f"BB中轨", line=dict(color="#AB47BC", width=0.8),
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_bb.index, y=df_bb["bb_lower"],
+            name=f"BB下轨", line=dict(color="#AB47BC", width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(171, 71, 188, 0.08)",
+        ))
+
+        # 突破点
+        if sma_fast_series is not None and sma_slow_series is not None:
+            close = df["close"]
+        else:
+            close = df["close"]
+        upper_break = df.index[close > df_bb["bb_upper"]]
+        lower_break = df.index[close < df_bb["bb_lower"]]
+        if len(upper_break) > 0:
+            fig.add_trace(go.Scatter(
+                x=upper_break, y=close.loc[upper_break],
+                mode="markers", marker=dict(symbol="x", size=8, color="#FF6F00"),
+                name=f"突破上轨 ({len(upper_break)})",
+            ))
+        if len(lower_break) > 0:
+            fig.add_trace(go.Scatter(
+                x=lower_break, y=close.loc[lower_break],
+                mode="markers", marker=dict(symbol="x", size=8, color="#1976D2"),
+                name=f"突破下轨 ({len(lower_break)})",
+            ))
+
+    fig.update_layout(
+        height=550,
+        title=f"{symbol} 策略叠加 (SMA{sma_fast}/{sma_slow}, BB{bb_period}±{bb_std}σ)",
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.02),
+    )
+    return fig
+
+
+def _render_overlay_summary(df, sma_fast, sma_slow, bb_period, bb_std,
+                            show_sma, show_bb, show_cross):
+    """显示当前策略状态摘要。"""
+    if df is None or len(df) < max(sma_slow, bb_period):
+        return
+
+    import pandas as pd
+    last = df["close"].iloc[-1]
+    cols = st.columns(3)
+
+    if show_sma or show_cross:
+        df_sma = DataProcessor.add_ma(df.copy(), periods=[sma_fast, sma_slow])
+        fast = df_sma[f"ma{sma_fast}"].iloc[-1]
+        slow = df_sma[f"ma{sma_slow}"].iloc[-1]
+        with cols[0]:
+            trend = "🟢 多头 (快>慢)" if fast > slow else "🔴 空头 (快<慢)"
+            st.metric(
+                f"SMA{sma_fast} vs SMA{sma_slow}",
+                f"{fast:.2f} / {slow:.2f}",
+                delta=f"{fast - slow:+.2f}",
+                help=trend,
+            )
+
+    if show_bb:
+        df_bb = DataProcessor.add_bollinger(df.copy(), period=bb_period, std=bb_std)
+        upper = df_bb["bb_upper"].iloc[-1]
+        mid = df_bb["bb_mid"].iloc[-1]
+        lower = df_bb["bb_lower"].iloc[-1]
+        with cols[1]:
+            position = (last - lower) / (upper - lower) * 100 if upper > lower else 50
+            st.metric(
+                f"BB 位置 ({bb_period}±{bb_std}σ)",
+                f"{position:.0f}%",
+                help=f"上 {upper:.2f} / 中 {mid:.2f} / 下 {lower:.2f}",
+            )
+        with cols[2]:
+            if last > upper:
+                state = "🔴 突破上轨（超买）"
+            elif last < lower:
+                state = "🟢 突破下轨（超卖）"
+            else:
+                state = "⚪ 通道内"
+            st.metric("BB 状态", state)
+
+    # 当前趋势简易总结
+    st.caption(
+        f"💡 最后价 {last:.2f} — "
+        f"{'看多信号占优' if (show_sma and (cols[0].delta_value if hasattr(cols[0], 'delta_value') else 0) > 0) else '看空信号占优'}"
+    )
 
 
 def _render_buy_sell_section(df, symbol: str, freq: str):

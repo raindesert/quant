@@ -927,6 +927,106 @@ class TestBuySellHelpers(unittest.TestCase):
         self.assertFalse(_is_nan(""))
 
 
+class TestStrategyOverlay(unittest.TestCase):
+    """测试策略信号叠加 helper。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = _install_fake_streamlit()
+        for mod in list(sys.modules.keys()):
+            if mod == "app" or mod.startswith("app."):
+                del sys.modules[mod]
+        import app  # noqa: F401
+        cls.app = app
+
+    def _fake_df(self, n: int = 100):
+        import pandas as pd
+        import numpy as np
+        idx = pd.date_range("2026-01-01", periods=n, freq="D")
+        np.random.seed(42)
+        prices = np.cumsum(np.random.normal(0, 1, n)) + 10
+        return pd.DataFrame({
+            "open": prices + np.random.normal(0, 0.1, n),
+            "high": prices + 0.5,
+            "low": prices - 0.5,
+            "close": prices,
+            "volume": np.ones(n) * 1_000_000,
+        }, index=idx)
+
+    def test_build_sma_only(self):
+        """只画 SMA 通道。"""
+        df = self._fake_df(100)
+        fig = self.app._build_strategy_overlay_fig(
+            df, "TEST", "day", sma_fast=5, sma_slow=20,
+            show_sma=True, show_bb=False, show_cross=False,
+        )
+        # 1 K线 + 2 SMA = 3 trace
+        self.assertEqual(len(fig.data), 3)
+
+    def test_build_bb_only(self):
+        """只画 BB 通道 (含可能的突破点)。"""
+        df = self._fake_df(100)
+        fig = self.app._build_strategy_overlay_fig(
+            df, "TEST", "day", sma_fast=5, sma_slow=20,
+            show_sma=False, show_bb=True, show_cross=False,
+        )
+        # 至少 4 个 trace (K + 3 BB线); 突破点可能 +1~2
+        self.assertGreaterEqual(len(fig.data), 4)
+
+    def test_build_cross_only(self):
+        """只画交叉标记。"""
+        df = self._fake_df(100)
+        fig = self.app._build_strategy_overlay_fig(
+            df, "TEST", "day", sma_fast=5, sma_slow=20,
+            show_sma=False, show_bb=False, show_cross=True,
+        )
+        # 1 K线 + 金叉(0+ 或多个) + 死叉
+        # 至少 1 个 trace
+        self.assertGreaterEqual(len(fig.data), 1)
+
+    def test_build_all_three(self):
+        """全开: K线 + 2 SMA + 金叉(可能0) + 死叉(可能0) + BB 3条 + 突破2(可能0)。"""
+        df = self._fake_df(100)
+        fig = self.app._build_strategy_overlay_fig(
+            df, "TEST", "day", sma_fast=5, sma_slow=20, bb_period=20, bb_std=2.0,
+            show_sma=True, show_bb=True, show_cross=True,
+        )
+        # 至少 1+2+3 = 6 trace (K + 2 SMA + 3 BB)
+        self.assertGreaterEqual(len(fig.data), 6)
+
+    def test_build_with_invalid_sma_order(self):
+        """快>=慢 → 跳过交叉检测, 不抛异常。"""
+        df = self._fake_df(100)
+        fig = self.app._build_strategy_overlay_fig(
+            df, "TEST", "day", sma_fast=20, sma_slow=5,  # 倒序
+            show_sma=True, show_bb=False, show_cross=True,
+        )
+        # 1 K + 2 SMA = 3 trace (没金叉/死叉)
+        self.assertEqual(len(fig.data), 3)
+
+    def test_build_empty_df(self):
+        """空 df → 返 None。"""
+        import pandas as pd
+        self.assertIsNone(
+            self.app._build_strategy_overlay_fig(pd.DataFrame(), "X", "day")
+        )
+
+    def test_build_none_df(self):
+        """None df → 返 None。"""
+        self.assertIsNone(
+            self.app._build_strategy_overlay_fig(None, "X", "day")
+        )
+
+    def test_overlay_summary_skips_short_data(self):
+        """数据 < 慢线周期 → summary 跳过, 不抛。"""
+        df = self._fake_df(10)  # 只有 10 行
+        # 不抛异常
+        self.app._render_overlay_summary(
+            df, sma_fast=5, sma_slow=20, bb_period=20, bb_std=2.0,
+            show_sma=True, show_bb=True, show_cross=True,
+        )
+
+
 class TestAppRouter(unittest.TestCase):
     """验证 _PAGE_ROUTER 字典完整性。"""
 
