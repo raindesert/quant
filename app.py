@@ -36,6 +36,7 @@ from risk.manager import RiskManager
 from utils.watchlist import (
     load_watchlist as _wl_load,
     add_stock as _wl_add,
+    remove_stock as _wl_remove,
     get_enabled_symbols as _wl_enabled,
     DEFAULT_PATH as _WATCHLIST_PATH,
 )
@@ -154,7 +155,7 @@ def render_sidebar() -> str:
         )
 
         # 快捷：加当前股票到自选
-        with st.expander("➕ 加到自选", expanded=False):
+        with st.expander("➕➖ 自选管理", expanded=False):
             cur_name = ""
             cur_tags = ""
             for s in watchlist:
@@ -164,28 +165,91 @@ def render_sidebar() -> str:
                     break
             name_in = st.text_input("名称", value=cur_name, key="sb_add_name")
             tags_in = st.text_input("标签 (逗号)", value=cur_tags, key="sb_add_tags")
-            if st.button("➕ 添加/更新", key="sb_add_btn", use_container_width=True):
-                if not st.session_state["global_symbol"]:
-                    st.error("股票代码为空")
-                else:
-                    tags_list = [t.strip() for t in tags_in.split(",") if t.strip()]
-                    # 用 add_stock; 已存在会返回 None — 走 update_stock
-                    result = _wl_add(st.session_state["global_symbol"], name_in, tags_list)
-                    if result is None:
-                        # 已存在 — 更新名称/tags
-                        from utils.watchlist import update_stock as _wl_update
-                        _wl_update(
-                            st.session_state["global_symbol"],
-                            name=name_in,
-                            tags=tags_list,
-                        )
-                        st.success("已更新")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("➕ 添加/更新", key="sb_add_btn", use_container_width=True):
+                    if not st.session_state["global_symbol"]:
+                        st.error("股票代码为空")
                     else:
-                        st.success(f"已添加 {result['symbol']}")
+                        tags_list = [t.strip() for t in tags_in.split(",") if t.strip()]
+                        # 用 add_stock; 已存在会返回 None — 走 update_stock
+                        result = _wl_add(st.session_state["global_symbol"], name_in, tags_list)
+                        if result is None:
+                            # 已存在 — 更新名称/tags
+                            from utils.watchlist import update_stock as _wl_update
+                            _wl_update(
+                                st.session_state["global_symbol"],
+                                name=name_in,
+                                tags=tags_list,
+                            )
+                            st.success("已更新")
+                        else:
+                            st.success(f"已添加 {result['symbol']}")
+                        st.rerun()
+            with col_b:
+                # 删除当前 global_symbol（如果在自选里）
+                in_wl = any(
+                    s["symbol"] == st.session_state["global_symbol"] for s in watchlist
+                )
+                if st.button(
+                    "🗑️ 删除当前",
+                    key="sb_del_btn",
+                    use_container_width=True,
+                    disabled=not in_wl,
+                ):
+                    ok = _wl_remove(st.session_state["global_symbol"])
+                    if ok:
+                        st.success(f"已删除 {st.session_state['global_symbol']}")
+                    else:
+                        st.warning("该股票不在自选中")
+                    st.rerun()
 
         st.markdown("---")
         st.caption(f"v6.0 | A股量化交易系统 | 自选 {len(watchlist)} 只")
     return page
+
+
+def symbol_input(label: str, default: str, key: str, help_text: str | None = None) -> str:
+    """股票代码输入：自选下拉 + 手动输入二选一。
+
+    - 如果自选非空，先显示下拉（"⭐ 从自选选"），再用 text_input 输入临时值
+    - 返回最终股票代码（已规范化）
+    """
+    from utils.watchlist import _normalize_symbol as _norm
+
+    enabled_syms = _wl_enabled()
+    default_sym = st.session_state.get("global_symbol", default)
+
+    if enabled_syms:
+        wl_labels = {sym: sym for sym in enabled_syms}
+        # 把 default 也加进去（如果不在自选里）
+        options = list(enabled_syms)
+        if default_sym and default_sym not in options:
+            options = [default_sym] + options
+        if default_sym not in options:
+            default_sym = options[0]
+        idx = options.index(default_sym) if default_sym in options else 0
+        chosen = st.selectbox(
+            "⭐ 从自选选",
+            options=options,
+            index=idx,
+            format_func=lambda x: wl_labels.get(x, x),
+            key=f"{key}_sel",
+            help=help_text or "优先从自选选；下方可手动输入覆盖",
+        )
+    else:
+        chosen = default_sym
+
+    manual = st.text_input(
+        label, value="", placeholder=default,
+        help=help_text or "可填 SZ 前缀或纯数字，自动规范化",
+        key=key,
+    )
+    if manual.strip():
+        n = _norm(manual)
+        if n:
+            return n
+    return chosen
 
 
 def metric_card(col, label, value, fmt=".2f", suffix="", is_pct=False):
@@ -397,8 +461,9 @@ def page_backtest():
     with st.sidebar:
         st.markdown("### 回测参数")
         # 用全局参数作默认值
-        symbol = st.text_input(
-            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+        symbol = symbol_input(
+            "股票代码（可手动覆盖）",
+            default=st.session_state.get("global_symbol", "000001.SZ"),
             key="bt_symbol",
         )
         strategy_name = st.selectbox(
@@ -995,8 +1060,9 @@ def page_walk_forward():
 
     with st.sidebar:
         st.markdown("### WF 参数")
-        symbol = st.text_input(
-            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+        symbol = symbol_input(
+            "股票代码（可手动覆盖）",
+            default=st.session_state.get("global_symbol", "000001.SZ"),
             key="wf_symbol",
         )
         strategy_name = st.selectbox("策略", list_strategies(), key="wf_strategy")
