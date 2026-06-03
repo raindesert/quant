@@ -1428,6 +1428,150 @@ def _render_kline_section(symbol: str, key_prefix: str = ""):
     fig.update_yaxes(title_text="成交量", row=2, col=1)
     st.plotly_chart(fig, use_container_width=True)
 
+    # ============== 技术指标副图 (v25 新增) ==============
+    _render_indicator_section(df)
+
+
+def _render_indicator_section(df):
+    """渲染 3 个技术指标副图 (MACD / RSI / KDJ)。
+
+    每个指标:
+    - expander 默认折叠
+    - plotly 单图/多 line 展示
+    - 关键参考线 (RSI 30/70, MACD 0, KDJ 20/80)
+    """
+    if df is None or len(df) < 5:
+        return
+
+    cols = st.columns(3)
+    with cols[0]:
+        show_macd = st.checkbox("MACD", value=True, key="ind_macd_toggle")
+    with cols[1]:
+        show_rsi = st.checkbox("RSI", value=False, key="ind_rsi_toggle")
+    with cols[2]:
+        show_kdj = st.checkbox("KDJ", value=False, key="ind_kdj_toggle")
+
+    # MACD
+    if show_macd:
+        with st.expander("📊 MACD (异同移动平均线)", expanded=True):
+            try:
+                df_macd = DataProcessor.add_macd(df.copy())
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df_macd.index, y=df_macd["macd_dif"],
+                    name="DIF (快线)", line=dict(color="#FFA726", width=1.5),
+                ))
+                fig.add_trace(go.Scatter(
+                    x=df_macd.index, y=df_macd["macd_dea"],
+                    name="DEA (慢线)", line=dict(color="#29B6F6", width=1.5),
+                ))
+                # MACD 柱
+                hist_colors = ["#d32f2f" if v >= 0 else "#388e3c" for v in df_macd["macd_hist"]]
+                fig.add_trace(go.Bar(
+                    x=df_macd.index, y=df_macd["macd_hist"],
+                    name="MACD", marker_color=hist_colors,
+                ))
+                # 0 轴
+                fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                fig.update_layout(
+                    height=350, hovermode="x unified",
+                    legend=dict(orientation="h", y=1.05),
+                    yaxis_title="MACD",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                # 解释
+                last_dif = df_macd["macd_hist"].iloc[-1] if len(df_macd) else 0
+                state = "金叉区域" if last_dif > 0 else "死叉区域"
+                st.caption(f"当前状态: **{state}** (DIF-DEA={last_dif:+.4f})")
+            except Exception as exc:
+                st.warning(f"MACD 渲染失败: {exc}")
+
+    # RSI
+    if show_rsi:
+        with st.expander("📈 RSI (相对强弱指标)", expanded=False):
+            try:
+                periods = [6, 12, 24]
+                fig = go.Figure()
+                colors = ["#FFA726", "#29B6F6", "#AB47BC"]
+                for p, c in zip(periods, colors):
+                    df_rsi = DataProcessor.add_rsi(df.copy(), period=p)
+                    fig.add_trace(go.Scatter(
+                        x=df_rsi.index, y=df_rsi["rsi"],
+                        name=f"RSI({p})", line=dict(color=c, width=1.2),
+                    ))
+                # 30/70 参考线
+                fig.add_hline(y=70, line_dash="dash", line_color="#d32f2f",
+                               annotation_text="超买 70", annotation_position="right",
+                               opacity=0.5)
+                fig.add_hline(y=30, line_dash="dash", line_color="#388e3c",
+                               annotation_text="超卖 30", annotation_position="right",
+                               opacity=0.5)
+                fig.add_hrect(y0=30, y1=70, fillcolor="gray", opacity=0.05)
+                fig.update_layout(
+                    height=350, hovermode="x unified",
+                    legend=dict(orientation="h", y=1.05),
+                    yaxis_title="RSI", yaxis_range=[0, 100],
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                # 当前 RSI(14) 状态
+                df_rsi_14 = DataProcessor.add_rsi(df.copy(), period=14)
+                last_rsi = df_rsi_14["rsi"].iloc[-1] if len(df_rsi_14) else 50
+                if last_rsi >= 70:
+                    state = "🔴 超买"
+                elif last_rsi <= 30:
+                    state = "🟢 超卖"
+                else:
+                    state = "⚪ 中性"
+                st.caption(f"当前 RSI(14): **{last_rsi:.2f}** {state}")
+            except Exception as exc:
+                st.warning(f"RSI 渲染失败: {exc}")
+
+    # KDJ
+    if show_kdj:
+        with st.expander("📉 KDJ (随机指标)", expanded=False):
+            try:
+                df_kdj = DataProcessor.add_kdj(df.copy())
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df_kdj.index, y=df_kdj["k"], name="K",
+                    line=dict(color="#FFA726", width=1.5),
+                ))
+                fig.add_trace(go.Scatter(
+                    x=df_kdj.index, y=df_kdj["d"], name="D",
+                    line=dict(color="#29B6F6", width=1.5),
+                ))
+                fig.add_trace(go.Scatter(
+                    x=df_kdj.index, y=df_kdj["j"], name="J",
+                    line=dict(color="#AB47BC", width=1.5, dash="dot"),
+                ))
+                fig.add_hline(y=80, line_dash="dash", line_color="#d32f2f",
+                               annotation_text="超买 80", annotation_position="right",
+                               opacity=0.5)
+                fig.add_hline(y=20, line_dash="dash", line_color="#388e3c",
+                               annotation_text="超卖 20", annotation_position="right",
+                               opacity=0.5)
+                fig.update_layout(
+                    height=350, hovermode="x unified",
+                    legend=dict(orientation="h", y=1.05),
+                    yaxis_title="KDJ", yaxis_range=[0, 100],
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                last_k = df_kdj["k"].iloc[-1] if len(df_kdj) else 50
+                last_d = df_kdj["d"].iloc[-1] if len(df_kdj) else 50
+                if last_k > last_d and last_k < 20:
+                    state = "🟢 K 上穿 D（金叉，超卖区）"
+                elif last_k > last_d and last_k < 50:
+                    state = "🟢 K 上穿 D（金叉）"
+                elif last_k < last_d and last_k > 80:
+                    state = "🔴 K 下穿 D（死叉，超买区）"
+                elif last_k < last_d and last_k > 50:
+                    state = "🔴 K 下穿 D（死叉）"
+                else:
+                    state = "⚪ 中性"
+                st.caption(f"当前 K={last_k:.2f}, D={last_d:.2f} — **{state}**")
+            except Exception as exc:
+                st.warning(f"KDJ 渲染失败: {exc}")
+
     # 简表
     with st.expander("📋 原始数据", expanded=False):
         st.dataframe(df.tail(20), use_container_width=True)

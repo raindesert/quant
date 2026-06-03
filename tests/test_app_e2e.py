@@ -730,6 +730,87 @@ class TestKlineSection(unittest.TestCase):
             self.app._fetch_kline_cached = original
 
 
+class TestIndicatorSection(unittest.TestCase):
+    """测试 _render_indicator_section (MACD / RSI / KDJ) 不抛异常。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = _install_fake_streamlit()
+        for mod in list(sys.modules.keys()):
+            if mod == "app" or mod.startswith("app."):
+                del sys.modules[mod]
+        import app  # noqa: F401
+        cls.app = app
+
+    def _fake_df(self, n: int = 60):
+        import pandas as pd
+        import numpy as np
+        idx = pd.date_range("2026-01-01", periods=n, freq="D")
+        np.random.seed(0)
+        prices = np.cumsum(np.random.normal(0, 1, n)) + 10
+        return pd.DataFrame({
+            "open": prices + np.random.normal(0, 0.1, n),
+            "high": prices + 0.5,
+            "low": prices - 0.5,
+            "close": prices,
+            "volume": np.ones(n) * 1_000_000,
+        }, index=idx)
+
+    def test_indicator_section_with_data(self):
+        """完整路径：60 行数据，默认 MACD 开。"""
+        self.app._render_indicator_section(self._fake_df(60))
+
+    def test_indicator_section_too_short(self):
+        """数据太短 (<5) → 直接 return，不抛。"""
+        self.app._render_indicator_section(self._fake_df(3))
+
+    def test_indicator_section_none(self):
+        """None 数据 → 直接 return。"""
+        self.app._render_indicator_section(None)
+
+    def test_indicator_section_explicit_all_off(self):
+        """通过 monkey-patch 把 checkbox 返 False，3 个指标都关闭。"""
+        # 替换 fake checkbox 行为：返 False
+        class _Col:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def checkbox(self, *a, **kw): return False
+
+        class _Columns:
+            def __call__(self, n):
+                if isinstance(n, int):
+                    return [_Col() for _ in range(n)]
+                return [_Col() for _ in n]
+
+        # monkey-patch st.columns
+        original_columns = self.app.st.columns
+        self.app.st.columns = _Columns()
+        try:
+            self.app._render_indicator_section(self._fake_df(60))
+        finally:
+            self.app.st.columns = original_columns
+
+    def test_indicator_section_explicit_all_on(self):
+        """3 个指标全开。"""
+        class _Col:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def checkbox(self, *a, **kw): return True
+
+        class _Columns:
+            def __call__(self, n):
+                if isinstance(n, int):
+                    return [_Col() for _ in range(n)]
+                return [_Col() for _ in n]
+
+        original_columns = self.app.st.columns
+        self.app.st.columns = _Columns()
+        try:
+            self.app._render_indicator_section(self._fake_df(60))
+        finally:
+            self.app.st.columns = original_columns
+
+
 class TestAppRouter(unittest.TestCase):
     """验证 _PAGE_ROUTER 字典完整性。"""
 
