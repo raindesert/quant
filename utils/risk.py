@@ -44,8 +44,9 @@ def value_at_risk(
 ) -> float:
     """历史 VaR (Value at Risk) — 在给定置信度下最差的可能损失。
 
-    例: 95% VaR = -0.02 表示 95% 置信度下最大单日损失不会超过 2%。
-    返回负数或 0（损失）。
+    返回**正数**表示损失大小 (loss magnitude)。
+    例: 95% VaR = 0.02 表示 95% 置信度下最大单日损失不超过 2%。
+    0 表示数据不足或无损失。
 
     method: 'historical' | 'parametric' (假设正态分布)
     """
@@ -59,11 +60,11 @@ def value_at_risk(
         # z-score: 95% = -1.645, 99% = -2.326
         z_table = {0.90: -1.282, 0.95: -1.645, 0.99: -2.326}
         z = z_table.get(confidence, -1.645)
-        return mu + z * sigma
+        return -(mu + z * sigma)  # 返正数 = 损失大小
     # historical: 取分位数
     sorted_rets = sorted(rets)
     idx = max(0, int(len(sorted_rets) * (1 - confidence)) - 1)
-    return -sorted_rets[idx]  # 负数表示损失
+    return -sorted_rets[idx]  # 返正数 = 损失大小
 
 
 def conditional_var(
@@ -72,7 +73,7 @@ def conditional_var(
 ) -> float:
     """CVaR / Expected Shortfall — VaR 之外的平均损失（更严格）。
 
-    返回负数。
+    返回**正数**表示损失大小 (loss magnitude)。0 表示数据不足或无损失。
     """
     rets = _to_returns(equity_curve)
     if not rets:
@@ -82,7 +83,7 @@ def conditional_var(
     tail = sorted_rets[:cutoff]
     if not tail:
         return 0.0
-    return -sum(tail) / len(tail)
+    return -sum(tail) / len(tail)  # 返正数 = 损失大小
 
 
 def max_drawdown(equity_curve) -> dict:

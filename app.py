@@ -1895,11 +1895,16 @@ def _render_overlay_summary(df, sma_fast, sma_slow, bb_period, bb_std,
                 state = "⚪ 通道内"
             st.metric("BB 状态", state)
 
-    # 当前趋势简易总结
-    st.caption(
-        f"💡 最后价 {last:.2f} — "
-        f"{'看多信号占优' if (show_sma and (cols[0].delta_value if hasattr(cols[0], 'delta_value') else 0) > 0) else '看空信号占优'}"
-    )
+    # 当前趋势简易总结 — 用 fast-slow 的差值直接判断 (修 v34 bug: cols[0].delta_value 永远不存在)
+    sma_diff = None
+    if show_sma or show_cross:
+        df_sma = DataProcessor.add_ma(df.copy(), periods=[sma_fast, sma_slow])
+        sma_diff = df_sma[f"ma{sma_fast}"].iloc[-1] - df_sma[f"ma{sma_slow}"].iloc[-1]
+    if sma_diff is not None and sma_diff > 0:
+        verdict = "看多信号占优"
+    else:
+        verdict = "看空信号占优"
+    st.caption(f"💡 最后价 {last:.2f} — {verdict}")
 
 
 def _render_buy_sell_section(df, symbol: str, freq: str):
@@ -2128,7 +2133,11 @@ def _calc_trade_pnl(trades: list) -> tuple[int, int, int]:
 
 
 def _mark_df_with_trades(df, trades: list):
-    """把 trades 按 date 对齐到 df.index，标出 buy/sell 在哪几行。"""
+    """把 trades 按 date 对齐到 df.index，标出 buy/sell 在哪几行。
+
+    日线数据 df 是 reset_index(drop=True) 整数 index；分钟线是 DatetimeIndex。
+    两种情况都能处理 — 用 date 列定位 (优先)，找不到再 fallback 到 index 比较。
+    """
     if df is None or len(df) == 0 or not trades:
         return None
     df = df.copy()
@@ -2140,16 +2149,27 @@ def _mark_df_with_trades(df, trades: list):
             date_str = date.strftime("%Y-%m-%d")
         else:
             date_str = str(date)[:10]
-        # 在 df 中找对应日期（取最近一根）
+        # 在 df 中找对应日期（取当天或之后的最近一行）
         try:
             import pandas as pd
             target_ts = pd.Timestamp(date_str)
-            # 取 date_str 当天或之后的最近一行
-            mask = df.index >= target_ts
-            if mask.any():
-                idx = df.index[mask][0]
-                df.at[idx, "_trade_marker"] = t.get("action", "")
-                df.at[idx, "_trade_price"] = t.get("price", 0)
+            # 1) 优先: 用 date 列 (字符串 YYYY-MM-DD) 匹配 — 兼容 reset_index 后整数 index
+            matched = False
+            if "date" in df.columns:
+                date_col = pd.to_datetime(df["date"], errors="coerce")
+                mask = date_col >= target_ts
+                if mask.any():
+                    idx = df.index[mask][0]
+                    df.at[idx, "_trade_marker"] = t.get("action", "")
+                    df.at[idx, "_trade_price"] = t.get("price", 0)
+                    matched = True
+            # 2) Fallback: index 直接比较 (分钟线 DatetimeIndex 走这里)
+            if not matched:
+                mask = df.index >= target_ts
+                if mask.any():
+                    idx = df.index[mask][0]
+                    df.at[idx, "_trade_marker"] = t.get("action", "")
+                    df.at[idx, "_trade_price"] = t.get("price", 0)
         except Exception:
             continue
     return df

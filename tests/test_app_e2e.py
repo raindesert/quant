@@ -1152,6 +1152,19 @@ class TestRiskMetrics(unittest.TestCase):
         var = value_at_risk(equity, 0.95)
         self.assertGreaterEqual(cvar, var)
 
+    def test_value_at_risk_returns_positive_magnitude(self):
+        """回归测试: VaR/CVaR 必须返正数 (loss magnitude)，不是 docstring 旧的负数语义。"""
+        from utils.risk import value_at_risk, conditional_var
+        # 模拟有损失的 equity_curve
+        equity = [100, 102, 101, 99, 98, 95, 97, 100, 99, 100, 100]
+        v_hist = value_at_risk(equity, 0.95)
+        v_param = value_at_risk(equity, 0.95, method="parametric")
+        cvar = conditional_var(equity, 0.95)
+        # 全部应 > 0 (返正数 = 损失大小)
+        self.assertGreater(v_hist, 0, f"VaR historical 应 > 0, got {v_hist}")
+        self.assertGreater(v_param, 0, f"VaR parametric 应 > 0, got {v_param}")
+        self.assertGreater(cvar, 0, f"CVaR 应 > 0, got {cvar}")
+
     def test_max_drawdown_simple(self):
         from utils.risk import max_drawdown
         equity = [100, 110, 120, 100, 80, 95, 105, 100]
@@ -1223,6 +1236,37 @@ class TestRiskMetrics(unittest.TestCase):
         # 数据不足
         self.assertEqual(monte_carlo_simulation([100], n_sims=10), [])
         self.assertEqual(monte_carlo_simulation([], n_sims=10), [])
+
+    def test_mark_df_with_trades_day_frequency(self):
+        """回归测试 v35: 日线 df 是 reset_index(drop=True) 整数 index,
+        _mark_df_with_trades 必须能正确标记 buy/sell (之前 TypeError 被 try/except 吞)."""
+        import pandas as pd
+        from app import _mark_df_with_trades
+        # 模拟 fetcher 日线返回 — reset_index(drop=True) 整数 index
+        df = pd.DataFrame({
+            "date": pd.to_datetime(["2025-01-15", "2025-01-16", "2025-01-17", "2025-01-20", "2025-01-21"]),
+            "open": [10, 11, 12, 11.5, 12],
+            "close": [11, 12, 11.5, 12, 12.5],
+            "high": [11.5, 12.5, 12, 12.5, 13],
+            "low": [9.5, 10.5, 11, 11, 11.5],
+            "volume": [100, 200, 150, 180, 220],
+        }).reset_index(drop=True)
+        trades = [
+            {"date": pd.Timestamp("2025-01-16"), "action": "buy", "price": 12.0, "quantity": 100},
+            {"date": pd.Timestamp("2025-01-20"), "action": "sell", "price": 12.5, "quantity": 100},
+        ]
+        marked = _mark_df_with_trades(df, trades)
+        self.assertIsNotNone(marked)
+        hits = marked[marked["_trade_marker"].notna()]
+        self.assertEqual(len(hits), 2, f"应标记 2 笔交易, 实际 {len(hits)}")
+        # 验证 buy 在 2025-01-16
+        buy = hits[hits["_trade_marker"] == "buy"]
+        self.assertEqual(len(buy), 1)
+        self.assertEqual(str(buy.iloc[0]["date"])[:10], "2025-01-16")
+        # 验证 sell 在 2025-01-20
+        sell = hits[hits["_trade_marker"] == "sell"]
+        self.assertEqual(len(sell), 1)
+        self.assertEqual(str(sell.iloc[0]["date"])[:10], "2025-01-20")
 
     def test_summary_risk_metrics(self):
         from utils.risk import summary_risk_metrics
