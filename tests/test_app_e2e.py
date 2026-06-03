@@ -536,6 +536,98 @@ class TestWatchlist(unittest.TestCase):
         symbols = {s["symbol"] for s in stocks}
         self.assertEqual(symbols, {"000001.SZ", "600000.SH"})
 
+    # ============== batch_backtest 单元测试 ==============
+
+    def test_batch_backtest_empty(self):
+        from utils.watchlist import batch_backtest
+        self.assertEqual(batch_backtest([]), [])
+
+    def test_batch_backtest_basic(self):
+        from utils.watchlist import batch_backtest
+        class FakeEngine:
+            def __init__(self, **kw): self.kw = kw
+            def run(self, strategy, symbol, days=250):
+                return {
+                    "profit_pct": float(hash(symbol) % 100) / 10,
+                    "sharpe_ratio": 0.5, "max_drawdown_pct": -1.0,
+                    "win_rate": 50.0, "trades": 5, "final_value": 1050000,
+                }
+        results = batch_backtest(
+            ["000001.SZ", "600000.SH", "000002.SZ"],
+            strategy_name="sma", days=60,
+            engine_factory=FakeEngine,
+        )
+        self.assertEqual(len(results), 3)
+        # 顺序保持
+        self.assertEqual([r["symbol"] for r in results],
+                         ["000001.SZ", "600000.SH", "000002.SZ"])
+        # 全部成功
+        self.assertTrue(all("summary" in r for r in results))
+
+    def test_batch_backtest_all_fail(self):
+        from utils.watchlist import batch_backtest
+        class FailEngine:
+            def run(self, *a, **kw): raise RuntimeError("net down")
+        results = batch_backtest(["A", "B"], engine_factory=FailEngine)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all("error" in r for r in results))
+
+    def test_batch_backtest_mixed(self):
+        from utils.watchlist import batch_backtest
+        class MixedFactory:
+            n = 0
+            def __call__(self):
+                type(self).n += 1
+                n = type(self).n
+                if n == 1:
+                    class _E:
+                        def run(self_, *a, **kw): raise RuntimeError("fail")
+                    return _E()
+                class _E:
+                    def run(self_, *a, **kw): return {"profit_pct": 5.0}
+                return _E()
+        results = batch_backtest(["A", "B"], engine_factory=MixedFactory())
+        statuses = ["error" in r for r in results]
+        self.assertNotEqual(statuses[0], statuses[1])
+
+    def test_rank_batch_by_profit_desc(self):
+        from utils.watchlist import rank_batch_results
+        results = [
+            {"symbol": "A", "summary": {"profit_pct": 1.0}},
+            {"symbol": "B", "summary": {"profit_pct": 5.0}},
+            {"symbol": "C", "summary": {"profit_pct": 3.0}},
+            {"symbol": "D", "error": "x"},
+        ]
+        ranked = rank_batch_results(results, metric="profit_pct", descending=True)
+        # 成功的 3 只按 desc 排序
+        self.assertEqual([r["symbol"] for r in ranked],
+                         ["B", "C", "A", "D"])
+        # rank 字段
+        self.assertEqual([r["rank"] for r in ranked], [1, 2, 3, 4])
+
+    def test_rank_batch_ascending_fails_last(self):
+        from utils.watchlist import rank_batch_results
+        results = [
+            {"symbol": "A", "summary": {"profit_pct": 1.0}},
+            {"symbol": "B", "summary": {"profit_pct": 5.0}},
+            {"symbol": "D", "error": "x"},
+        ]
+        # 升序 (回撤越小越好): 失败放最后
+        ranked = rank_batch_results(results, metric="profit_pct", descending=False)
+        self.assertEqual(ranked[0]["symbol"], "A")
+        self.assertEqual(ranked[1]["symbol"], "B")
+        self.assertEqual(ranked[2]["symbol"], "D")  # 失败放最后
+
+    def test_rank_different_metric(self):
+        from utils.watchlist import rank_batch_results
+        results = [
+            {"symbol": "A", "summary": {"sharpe_ratio": 0.5, "profit_pct": 5.0}},
+            {"symbol": "B", "summary": {"sharpe_ratio": 1.5, "profit_pct": 1.0}},
+        ]
+        ranked = rank_batch_results(results, metric="sharpe_ratio", descending=True)
+        # B (1.5) > A (0.5)
+        self.assertEqual([r["symbol"] for r in ranked], ["B", "A"])
+
 
 class TestAppRouter(unittest.TestCase):
     """验证 _PAGE_ROUTER 字典完整性。"""

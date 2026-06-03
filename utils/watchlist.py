@@ -220,3 +220,112 @@ def import_csv(content: str, path: Path | str = DEFAULT_PATH) -> int:
     if added:
         save_watchlist(stocks, path)
     return added
+
+
+# ============== 快速批量回测（v20 新增） ==============
+
+def batch_backtest(
+    symbols: list[str],
+    strategy_name: str = "sma",
+    days: int = 250,
+    initial_cash: float = 1_000_000,
+    commission: float = 0.0003,
+    stop_loss: float = 0.0,
+    take_profit: float = 0.0,
+    position_size: float = 1.0,
+    engine_factory=None,
+) -> list[dict]:
+    """快速批量回测：依次对 N 只自选股票跑同一策略，返回 summary 列表。
+
+    Args:
+        symbols: 股票代码列表
+        strategy_name: 策略名
+        days: 回测天数
+        initial_cash / commission / stop_loss / take_profit / position_size:
+            传给 BacktestEngine
+        engine_factory: 工厂函数 (symbol) -> BacktestEngine 实例。
+            默认 lambda: BacktestEngine(initial_cash=..., commission=..., ...)，
+            测试可注入 fake engine 避免真实网络请求。
+
+    Returns:
+        list of dict，每个 dict = {"symbol", "strategy", "summary"} 或
+        {"symbol", "strategy", "error": str} 表示失败。
+        顺序与输入 symbols 相同。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from backtest.engine import BacktestEngine
+    from strategy.registry import create_strategy
+
+    if engine_factory is None:
+        engine_factory = lambda: BacktestEngine(  # noqa: E731
+            initial_cash=initial_cash, commission=commission,
+            stop_loss=stop_loss, take_profit=take_profit,
+            position_size=position_size,
+        )
+
+    def _run_one(sym: str) -> dict:
+        try:
+            strategy = create_strategy(strategy_name)
+            engine = engine_factory()
+            summary = engine.run(strategy, sym, days=days)
+            if summary is None:
+                return {"symbol": sym, "strategy": strategy_name, "error": "回测失败（无数据）"}
+            summary["symbol"] = sym
+            summary["strategy"] = strategy_name
+            return {"symbol": sym, "strategy": strategy_name, "summary": summary}
+        except Exception as exc:
+            return {"symbol": sym, "strategy": strategy_name, "error": str(exc)}
+
+    if not symbols:
+        return []
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(4, len(symbols))) as pool:
+        futures = {pool.submit(_run_one, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                r = fut.result(timeout=60)
+            except Exception as exc:
+                r = {"symbol": sym, "strategy": strategy_name, "error": str(exc)}
+            results.append(r)
+
+    # 按输入顺序排序
+    sym_to_result = {r["symbol"]: r for r in results}
+    return [sym_to_result.get(s, {"symbol": s, "strategy": strategy_name, "error": "lost"}) for s in symbols]
+
+
+def rank_batch_results(
+    results: list[dict],
+    metric: str = "profit_pct",
+    descending: bool = True,
+) -> list[dict]:
+    """对批量回测结果按指定指标排序。
+
+    Args:
+        results: batch_backtest 的返回
+        metric: 排序键 (profit_pct / sharpe_ratio / max_drawdown_pct / win_rate)
+        descending: True=降序（收益率高的在前）
+
+    Returns:
+        排序后的 results（带 rank 字段）。
+    """
+    def _sort_key(r):
+        """失败的始终放最后。"""
+        if "summary" in r:
+            # (failed_flag=0, value) — desc 时按 value desc，asc 时按 value asc
+            return (0, r["summary"].get(metric, 0))
+        # 失败: (1,) — sort 时用 reverse 翻转整体, 但要保证始终在最后
+        # Python sort: reverse=True 反转整个元组比较
+        # (1, 0) > (0, X) 在 desc 时变 <，排第一 — 错
+        # 改用: 失败返回 0+value 极值, 通过 wrapping
+        if descending:
+            # desc: 失败放最末 (rank N) — 需 value 最小
+            return (0, float("-inf"))
+        # asc: 失败放最末 (rank N) — 需 value 最大
+        return (0, float("inf"))
+
+    sorted_results = sorted(results, key=_sort_key, reverse=descending)
+    for i, r in enumerate(sorted_results, 1):
+        r["rank"] = i
+    return sorted_results

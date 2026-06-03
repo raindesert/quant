@@ -1614,6 +1614,177 @@ def page_watchlist():
                 st.success(f"导入 {n} 个新股票")
                 st.rerun()
 
+    # ============== 快速批量回测 (v20 新增) ==============
+    _render_batch_backtest_section(stocks)
+
+
+def _render_batch_backtest_section(stocks: list[dict]):
+    """在自选页底部渲染"快速批量回测"section。"""
+    from utils.watchlist import batch_backtest, rank_batch_results
+
+    st.markdown("---")
+    st.subheader("🚀 快速批量回测")
+    st.caption("选几只自选股票 + 一个策略，一键并发回测（结果自动入历史）")
+
+    if not stocks:
+        st.info("自选为空，先到上面添加股票")
+        return
+
+    enabled = [s for s in stocks if s.get("enabled", True)]
+    if not enabled:
+        st.info("没有启用的自选股票")
+        return
+
+    # 参数表单
+    with st.form("wl_batch_bt"):
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            # 多选 enabled 自选
+            sym_options = [s["symbol"] for s in enabled]
+            sym_labels = [
+                f"{s['symbol']} — {s.get('name', '') or '无'}" for s in enabled
+            ]
+            sel_syms = st.multiselect(
+                "选择股票", options=sym_options,
+                default=sym_options[: min(3, len(sym_options))],
+                format_func=lambda x: dict(zip(sym_options, sym_labels)).get(x) or x,
+            )
+        with col2:
+            strat = st.selectbox(
+                "策略", options=list_strategies(),
+                index=list_strategies().index("sma") if "sma" in list_strategies() else 0,
+                format_func=lambda x: x.upper(),
+            )
+        with col3:
+            days = st.number_input("回测天数", 30, 500, 120, 30)
+        with col4:
+            position_size = st.number_input("仓位", 0.1, 1.0, 1.0, 0.1, format="%.1f")
+
+        col5, col6 = st.columns(2)
+        with col5:
+            stop_loss = st.number_input("止损", 0.0, 0.5, 0.0, 0.01, format="%.2f")
+        with col6:
+            take_profit = st.number_input("止盈", 0.0, 1.0, 0.0, 0.05, format="%.2f")
+
+        submitted = st.form_submit_button("🚀 开始批量回测", use_container_width=True, type="primary")
+
+    if not submitted:
+        return
+
+    if not sel_syms:
+        st.warning("请至少选一只股票")
+        return
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    def _engine_factory():
+        return BacktestEngine(
+            initial_cash=CONFIG.get("initial_cash", 1_000_000),
+            commission=CONFIG.get("backtest", {}).get("commission", 0.0003),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            position_size=position_size,
+        )
+
+    # 进度条模拟（实际并发，不可预知每个完成时间）
+    status.text(f"⏳ 开始并发回测 {len(sel_syms)} 只股票...")
+
+    try:
+        results = batch_backtest(
+            symbols=sel_syms,
+            strategy_name=strat,
+            days=days,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            position_size=position_size,
+            engine_factory=_engine_factory,
+        )
+    except Exception as exc:
+        st.error(f"批量回测失败: {exc}")
+        return
+
+    progress.progress(100)
+    status.text("✅ 完成")
+
+    # 排序
+    ranked = rank_batch_results(results, metric="profit_pct", descending=True)
+
+    # 入历史
+    for r in ranked:
+        if "summary" in r:
+            _history_add(r["summary"], mode="batch_backtest")
+
+    # 概览
+    successful = [r for r in ranked if "summary" in r]
+    failed = [r for r in ranked if "error" in r]
+    avg_p = (
+        sum(r["summary"].get("profit_pct", 0) for r in successful) / len(successful)
+        if successful else 0
+    )
+    best = successful[0] if successful else None
+    worst = successful[-1] if successful else None
+
+    st.markdown("#### 📊 概览")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("完成", f"{len(successful)}/{len(ranked)}")
+    c2.metric("失败", len(failed))
+    c3.metric("平均收益", f"{avg_p:+.2f}%")
+    c4.metric(
+        "最佳",
+        f"{best['summary']['profit_pct']:+.2f}%" if best else "—",
+        help=best["symbol"] if best else None,
+    )
+
+    st.markdown("---")
+    st.markdown("#### 🏆 排行榜")
+
+    # 表格
+    rows = []
+    for r in ranked:
+        if "error" in r:
+            rows.append({
+                "排名": r["rank"],
+                "代码": r["symbol"],
+                "状态": f"❌ {r['error']}",
+            })
+        else:
+            s = r["summary"]
+            rows.append({
+                "排名": r["rank"],
+                "代码": r["symbol"],
+                "收益率%": f"{s.get('profit_pct', 0):+.2f}",
+                "夏普": f"{s.get('sharpe_ratio', 0):.2f}",
+                "回撤%": f"{s.get('max_drawdown_pct', 0):.2f}",
+                "胜率%": f"{s.get('win_rate', 0):.1f}",
+                "交易数": s.get("trades", 0),
+            })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # 散点：收益 vs 回撤
+    if successful and len(successful) >= 2:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=[r["summary"].get("max_drawdown_pct", 0) for r in successful],
+            y=[r["summary"].get("profit_pct", 0) for r in successful],
+            mode="markers+text",
+            text=[r["symbol"] for r in successful],
+            textposition="top center",
+            marker=dict(size=14, color="#58a6ff"),
+        ))
+        fig.update_layout(
+            xaxis_title="最大回撤 %",
+            yaxis_title="收益率 %",
+            title="收益 vs 回撤",
+            height=400,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    if failed:
+        with st.expander(f"❌ 失败明细 ({len(failed)} 只)", expanded=False):
+            for r in failed:
+                st.text(f"  {r['symbol']}: {r['error']}")
+
 
 # 页面路由表 — 精确匹配常量，避免字符串包含误判
 _PAGE_ROUTER = {
