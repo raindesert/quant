@@ -44,7 +44,10 @@ class _FakeCtx:
     def markdown(self, *a, **kw): pass
     def write(self, *a, **kw): pass
     def plotly_chart(self, *a, **kw): pass
-    def dataframe(self, *a, **kw): pass
+    def dataframe(self, df=None, *a, **kw):
+        # 存最新 dataframe 用于断言 (防 emoji 错位)
+        self.last_dataframe = df
+        pass
     def json(self, *a, **kw): pass
     def info(self, *a, **kw): pass
     def error(self, *a, **kw): pass
@@ -122,7 +125,10 @@ class FakeStreamlitRecorder:
     def tabs(self, names): return [_FakeCtx() for _ in names]
     def download_button(self, *a, **kw): self.downloads.append(a[0] if a else "")
     def plotly_chart(self, *a, **kw): pass
-    def dataframe(self, *a, **kw): pass
+    def dataframe(self, df=None, *a, **kw):
+        # 存最新 dataframe 用于断言 (防 emoji 错位)
+        self.last_dataframe = df
+        pass
     def info(self, *a, **kw): pass
     def error(self, *a, **kw): self.errors.append(a[0] if a else "")
     def warning(self, *a, **kw): self.warnings.append(a[0] if a else "")
@@ -950,6 +956,34 @@ class TestBuySellHelpers(unittest.TestCase):
         self.assertFalse(_is_nan(0))
         self.assertFalse(_is_nan(0.0))
         self.assertFalse(_is_nan(""))
+
+    def test_display_trades_table_buy_sell_colors(self):
+        """验证交易明细里买/卖 emoji 颜色 (防 v34 bug: 买显示成卖)。"""
+        trades = [
+            {"date": "2026-01-15", "action": "buy", "price": 10.0, "quantity": 1000},
+            {"date": "2026-02-01", "action": "sell", "price": 11.0, "quantity": 1000},
+        ]
+        # _display_trades_table 走 fake_streamlit, 不抛
+        self.app._display_trades_table(trades)
+        # display_trades_table 走 st.dataframe
+        summary = {
+            "trades_list": [
+                {"date": "2026-01-15", "action": "buy", "price": 10.0, "quantity": 1000,
+                 "total": 10000, "commission": 5, "stamp_tax": 0},
+                {"date": "2026-02-01", "action": "sell", "price": 11.0, "quantity": 1000,
+                 "total": 11000, "commission": 5, "stamp_tax": 5.5},
+            ]
+        }
+        self.app.display_trades_table(summary)
+        # 验证 fake_st 收到的 records (从 rec 实例读)
+        df = self.rec.last_dataframe
+        self.assertIsNotNone(df, "dataframe 没被调用")
+        op_col = list(df["操作"])
+        # 第一个 buy → "🟢 买入", 第二个 sell → "🔴 卖出"
+        self.assertEqual(op_col[0], "🟢 买入",
+                          f"买入应显示绿色, 实际: {op_col[0]}")
+        self.assertEqual(op_col[1], "🔴 卖出",
+                          f"卖出应显示红色, 实际: {op_col[1]}")
 
 
 class TestStrategyOverlay(unittest.TestCase):

@@ -371,9 +371,17 @@ def display_trades_table(summary):
 
     rows = []
     for t in trades:
+        action = t.get("action", "")
+        # 买入🟢（绿色入场） / 卖出🔴（红色出场）— 与 A 股 UI 惯例一致
+        if action == "buy":
+            op_label = "🟢 买入"
+        elif action == "sell":
+            op_label = "🔴 卖出"
+        else:
+            op_label = f"⚪ {action}"
         rows.append({
             "日期": t.get("date", ""),
-            "操作": "买入 🔴" if t.get("action") == "buy" else "卖出 🟢",
+            "操作": op_label,
             "价格": f"{t.get('price', 0):.2f}",
             "数量": t.get("quantity", 0),
             "金额": f"{t.get('total', 0):,.2f}",
