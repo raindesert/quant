@@ -1071,6 +1071,39 @@ class TestBuySellHelpers(unittest.TestCase):
                                                  "TEST", "day")
         self.assertEqual(len(fig.data), 2)  # K + buy
 
+    def test_build_kline_with_markers_uppercase_action(self):
+        """回归: 真实回测返的 action 是大写 'BUY'/'SELL', K 线上仍要显示买卖点。
+
+        历史 bug: _build_kline_with_markers 硬比对小写 'buy'/'sell',
+        大写路径 trace 数=1 (只有 K 线, 没有买卖点)。
+        修复: marker.lower() 兼容。
+        """
+        import pandas as pd
+        df = pd.DataFrame({
+            "open": [10, 11, 12, 13], "high": [10, 11, 12, 13],
+            "low": [10, 11, 12, 13], "close": [10, 11, 12, 13],
+            "volume": [1, 1, 1, 1],
+            "_trade_marker": [None, "BUY", None, "SELL"],  # 大写, 模拟 BacktestEngine
+            "_trade_price": [None, 11.0, None, 13.0],
+        }, index=pd.date_range("2026-01-01", periods=4, freq="D"))
+        trades = [
+            {"date": "2026-01-02", "action": "BUY",  "price": 11.0},  # 大写
+            {"date": "2026-01-04", "action": "SELL", "price": 13.0},  # 大写
+        ]
+        fig = self.app._build_kline_with_markers(df, trades, "TEST", "day")
+        # 修复后: 3 个 trace (K线 + 买 + 卖)
+        self.assertEqual(len(fig.data), 3,
+                         f"大写 BUY/SELL 应渲染 3 个 trace (K+买+卖), 实际 {len(fig.data)}")
+        # 验证买卖点 trace 真的非空
+        names = [tr.name for tr in fig.data]
+        self.assertIn("买入", names, "没找到买入 trace")
+        self.assertIn("卖出", names, "没找到卖出 trace")
+        for tr in fig.data:
+            if tr.name == "买入":
+                self.assertEqual(len(tr.x), 1)
+            elif tr.name == "卖出":
+                self.assertEqual(len(tr.x), 1)
+
     def test_is_nan(self):
         """_is_nan 工具。"""
         from app import _is_nan

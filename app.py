@@ -2192,10 +2192,12 @@ def _build_kline_with_markers(df, trades: list, symbol: str, freq: str):
     for idx, row in df.iterrows():
         marker = row.get("_trade_marker")
         price = row.get("_trade_price")
-        if marker == "buy" and price is not None and not _is_nan(price):
+        # 大小写兼容: 真实回测返 "BUY"/"SELL", 手动输入/CSV 返 "buy"/"sell"
+        marker_lower = marker.lower() if isinstance(marker, str) else marker
+        if marker_lower == "buy" and price is not None and not _is_nan(price):
             buy_x.append(idx)
             buy_y.append(price)
-        elif marker == "sell" and price is not None and not _is_nan(price):
+        elif marker_lower == "sell" and price is not None and not _is_nan(price):
             sell_x.append(idx)
             sell_y.append(price)
 
