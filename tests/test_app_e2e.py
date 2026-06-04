@@ -298,6 +298,56 @@ class TestAppPages(unittest.TestCase):
         # 详情
         self.app._render_quote_detail(quote_ok)
 
+    def test_symbol_input_works_with_watchlist(self):
+        """回归: 3 个原本没接自选下拉的 sidebar page (策略对比/参数优化/多策略)
+        改用 symbol_input 后, 自选有股票时仍能跑通 + 真的渲染了自选下拉。
+
+        注意: YAML 预设创建表单在 st.form 内, 用 text_input 而非 symbol_input
+        (form 内 selectbox 限制 + form 一次性创建场景), 已在 page_yaml_preset
+        内把默认 symbol 改成跟 global_symbol 联动。
+        """
+        # 1. 拦截 selectbox 调用, 记录 label
+        # 注意: setUpClass 时 fake.selectbox 是 bound method 拷贝,
+        # 改 rec.selectbox 不影响 fake, 必须改 sys.modules["streamlit"]
+        import streamlit as _st_mod
+        selectbox_calls = []
+        original_sb = _st_mod.selectbox
+        def _track_selectbox(*a, **kw):
+            if a:
+                selectbox_calls.append(a[0])
+            return original_sb(*a, **kw)
+        _st_mod.selectbox = _track_selectbox
+        # sidebar 用的是 FakeSidebar.selectbox 实例属性 — 改它
+        original_sidebar_sb = self.rec._sidebar.selectbox
+        def _track_sidebar_selectbox(*a, **kw):
+            if a:
+                selectbox_calls.append(a[0])
+            return original_sidebar_sb(*a, **kw)
+        self.rec._sidebar.selectbox = _track_sidebar_selectbox
+
+        # 2. 临时替换 _wl_enabled 返 2 只股票 (不动用户真文件)
+        original_enabled = self.app._wl_enabled
+        self.app._wl_enabled = lambda: ["000001.SZ", "600000.SH"]
+        try:
+            # 3 个 sidebar page 都跑一遍, 验证不抛
+            for page_const in [
+                self.app.PAGE_COMPARISON,
+                self.app.PAGE_OPTIMIZE,
+                self.app.PAGE_MULTI_STRATEGY,
+            ]:
+                self._run_page(page_const)
+        finally:
+            self.app._wl_enabled = original_enabled
+            _st_mod.selectbox = original_sb
+            self.rec._sidebar.selectbox = original_sidebar_sb
+
+        # 3. 验证: 3 个 page 都应该渲染 "⭐ 从自选选" 的下拉
+        wl_label_count = selectbox_calls.count("⭐ 从自选选")
+        self.assertEqual(wl_label_count, 3,
+                         f"3 个 page 改用 symbol_input 后应各渲染一次自选下拉, "
+                         f"实际渲染 {wl_label_count} 次; "
+                         f"看到的 selectbox labels: {selectbox_calls[:15]}")
+
     def test_page_history(self):
         # 空历史：应显示 info，不抛异常
         self.rec.session_state[self.app.HISTORY_KEY] = []

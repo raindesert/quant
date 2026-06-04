@@ -619,7 +619,11 @@ def page_strategy_comparison():
 
     with st.sidebar:
         st.markdown("### 对比参数")
-        symbol = st.text_input("股票代码", value="000001.SZ", key="cmp_symbol")
+        symbol = symbol_input(
+            "股票代码（可手动覆盖）",
+            default=st.session_state.get("global_symbol", "000001.SZ"),
+            key="cmp_symbol",
+        )
         days = st.slider("回测天数", 30, 500, 250, key="cmp_days")
         selected_strategies = st.multiselect("选择策略", list_strategies(), default=list_strategies())
 
@@ -711,8 +715,9 @@ def page_optimize():
 
     with st.sidebar:
         st.markdown("### 优化参数")
-        symbol = st.text_input(
-            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+        symbol = symbol_input(
+            "股票代码（可手动覆盖）",
+            default=st.session_state.get("global_symbol", "000001.SZ"),
             key="opt_symbol",
         )
         strategy_name = st.selectbox(
@@ -833,8 +838,9 @@ def page_multi_strategy():
 
     with st.sidebar:
         st.markdown("### 组合参数")
-        symbol = st.text_input(
-            "股票代码", value=st.session_state.get("global_symbol", "000001.SZ"),
+        symbol = symbol_input(
+            "股票代码（可手动覆盖）",
+            default=st.session_state.get("global_symbol", "000001.SZ"),
             key="ms_symbol",
         )
         days = st.slider(
@@ -1039,7 +1045,10 @@ def page_yaml_preset():
             name = st.text_input("预设名 (不含后缀)", value="my_strategy")
             mode = st.selectbox("mode", ["backtest", "optimize", "walkforward", "multi_strategy"])
             strategy = st.selectbox("strategy", list_strategies())
-            symbol = st.text_input("symbol", value="000001.SZ")
+            # form 内不调 _wl_enabled 避免副作用，文本输入即可
+            symbol = st.text_input(
+                "symbol", value=st.session_state.get("global_symbol", "000001.SZ"),
+            )
             days = st.number_input("days", 30, 500, 250)
             stop_loss = st.number_input("stop_loss", 0.0, 0.5, 0.0, 0.01, format="%.2f")
             take_profit = st.number_input("take_profit", 0.0, 1.0, 0.0, 0.05, format="%.2f")
