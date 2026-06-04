@@ -1478,6 +1478,12 @@ def _render_kline_section(symbol: str, key_prefix: str = ""):
         st.error(f"数据缺列: {missing}")
         return
 
+    # 把 date 设成 index — DataFetcher.get_history 返回的是 RangeIndex (0..N)，
+    # 下面 Candlestick 用 x=df.index，没 date index 时横坐标就是数字 0,1,2…
+    if "date" in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.set_index("date", drop=False)
+
     # 计算 MA
     for p in ma_periods:
         df[f"ma{p}"] = df["close"].rolling(window=p, min_periods=1).mean()
