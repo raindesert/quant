@@ -29,6 +29,12 @@ from backtest.optimizer import StrategyOptimizer, DEFAULT_GRIDS, OPTIMIZE_METRIC
 from backtest.multi_strategy import MultiStrategyEngine
 from backtest.output import export_html_report
 from backtest.walk_forward import WalkForwardValidator
+from heatmap.runner import (
+    STRATEGY_GRID as HEATMAP_STRATEGY_GRID,
+    run_grid as heatmap_run_grid,
+    list_strategy_param_keys as heatmap_list_params,
+    get_param_meta as heatmap_param_meta,
+)
 from config.loader import load_config as load_user_config, merge_config_with_args
 from data.fetcher import DataFetcher
 from data.processor import DataProcessor
@@ -66,10 +72,12 @@ PAGE_REALTIME = "📡 实时行情"
 PAGE_HISTORY = "🗂️ 回测历史"
 PAGE_WATCHLIST = "⭐ 自选股票"
 PAGE_RISK = "📉 风险分析"
+PAGE_HEATMAP = "🔥 参数热图"
 
 ALL_PAGES = [
     PAGE_BACKTEST, PAGE_COMPARISON, PAGE_OPTIMIZE, PAGE_MULTI_STRATEGY,
     PAGE_YAML, PAGE_WALK_FORWARD, PAGE_REALTIME, PAGE_HISTORY, PAGE_WATCHLIST, PAGE_RISK,
+    PAGE_HEATMAP,
 ]
 
 
@@ -2527,6 +2535,248 @@ def _render_monte_carlo(equity):
                    delta=f"{(final_p95 / last_real - 1) * 100:+.2f}%" if last_real > 0 else None)
 
 
+def page_param_heatmap():
+    """参数敏感性热图 — 二维网格扫描 + 颜色 = 选定指标。
+
+    6 个策略 (SMA/RSI/MACD/Bollinger/Momentum/MeanReversion) 各自有 2 个可调参数。
+    并发跑网格，结果缓存到 ~/.quant_heatmap_cache/ (24h TTL)。
+    """
+    st.header("🔥 参数热图")
+
+    with st.sidebar:
+        st.markdown("### 网格配置")
+        symbol = symbol_input(
+            "股票代码（可手动覆盖）",
+            default=st.session_state.get("global_symbol", "000001.SZ"),
+            key="heat_symbol",
+        )
+        strategy_name = st.selectbox(
+            "策略", list_strategies(), key="heat_strategy",
+        )
+        param_keys = heatmap_list_params(strategy_name)
+        # 横轴/纵轴参数选择
+        x_param = st.selectbox("横轴参数", param_keys,
+                              index=0, key="heat_x_param",
+                              format_func=lambda p: f"{p} ({heatmap_param_meta(strategy_name, p)['label']})")
+        y_param = st.selectbox("纵轴参数", param_keys,
+                              index=min(1, len(param_keys) - 1), key="heat_y_param",
+                              format_func=lambda p: f"{p} ({heatmap_param_meta(strategy_name, p)['label']})")
+        if x_param == y_param:
+            st.error("横纵参数必须不同")
+            return
+
+        x_meta = heatmap_param_meta(strategy_name, x_param)
+        y_meta = heatmap_param_meta(strategy_name, y_param)
+
+        # 范围滑块 — 用 step 推断整数还是浮点
+        def _is_int_step(s):
+            return isinstance(s, int) or (isinstance(s, float) and s.is_integer())
+
+        if _is_int_step(x_meta["step"]):
+            x_min, x_max = st.slider(
+                f"{x_param} 范围", int(x_meta["min"]), int(x_meta["max"]),
+                value=(int(x_meta["min"]), min(int(x_meta["min"]) + 10, int(x_meta["max"]))),
+                step=int(x_meta["step"]), key="heat_x_range",
+            )
+            x_range = (x_min, x_max, int(x_meta["step"]))
+        else:
+            x_min, x_max = st.slider(
+                f"{x_param} 范围 (浮点)", float(x_meta["min"]), float(x_meta["max"]),
+                value=(float(x_meta["min"]), min(float(x_meta["min"]) + 0.1, float(x_meta["max"]))),
+                step=float(x_meta["step"]), key="heat_x_range_f",
+            )
+            x_range = (x_min, x_max, float(x_meta["step"]))
+
+        if _is_int_step(y_meta["step"]):
+            y_min, y_max = st.slider(
+                f"{y_param} 范围", int(y_meta["min"]), int(y_meta["max"]),
+                value=(int(y_meta["min"]), min(int(y_meta["min"]) + 20, int(y_meta["max"]))),
+                step=int(y_meta["step"]), key="heat_y_range",
+            )
+            y_range = (y_min, y_max, int(y_meta["step"]))
+        else:
+            y_min, y_max = st.slider(
+                f"{y_param} 范围 (浮点)", float(y_meta["min"]), float(y_meta["max"]),
+                value=(float(y_meta["min"]), min(float(y_meta["min"]) + 0.05, float(y_meta["max"]))),
+                step=float(y_meta["step"]), key="heat_y_range_f",
+            )
+            y_range = (y_min, y_max, float(y_meta["step"]))
+
+        days = st.slider(
+            "回测天数", 60, 500,
+            value=st.session_state.get("global_days", 250),
+            key="heat_days",
+        )
+        metric = st.selectbox(
+            "热图指标", list(OPTIMIZE_METRICS.keys()),
+            index=1,  # 默认夏普
+            format_func=lambda x: OPTIMIZE_METRICS[x],
+            key="heat_metric",
+        )
+        use_cache = st.checkbox("使用缓存 (24h TTL)", value=True, key="heat_usecache")
+        run_btn = st.button("🚀 跑热图", type="primary", key="heat_run")
+
+    # 网格大小预估
+    from heatmap.runner import enumerate_grid as _enum
+    preview_combos = _enum(strategy_name, x_param, y_param, x_range, y_range)
+    n_combos = len(preview_combos)
+    st.info(
+        f"**{strategy_name.upper()}** | 横轴 {x_param} ∈ [{x_range[0]}, {x_range[1]}] "
+        f"step {x_range[2]} | 纵轴 {y_param} ∈ [{y_range[0]}, {y_range[1]}] step {y_range[2]} | "
+        f"**{n_combos}** 个组合 | 指标: {OPTIMIZE_METRICS[metric]}"
+    )
+
+    # 检查约束 (e.g. MACD fast<slow 自动剔除，会让实际数 < n_combos)
+    if strategy_name == "macd" and "fast" in (x_param, y_param) and "slow" in (x_param, y_param):
+        st.caption("⚠️ MACD 约束 fast < slow，无效组合已自动剔除")
+
+    if not run_btn and "heat_result" not in st.session_state:
+        st.caption("👈 在左侧选范围，按 **跑热图** 开始")
+        return
+
+    # 跑网格
+    if run_btn:
+        st.session_state.pop("heat_result", None)
+        progress = st.progress(0.0, text="准备中...")
+        status = st.empty()
+        def _cb(done, total):
+            progress.progress(done / max(total, 1), text=f"回测 {done}/{total}")
+        with st.spinner("跑网格中..."):
+            result = heatmap_run_grid(
+                strategy=strategy_name, symbol=symbol,
+                x_param=x_param, y_param=y_param,
+                x_range=x_range, y_range=y_range,
+                days=days, use_cache=use_cache, progress_callback=_cb,
+            )
+        progress.empty()
+        status.success(
+            f"✅ 完成 — total={result['total']} cached={result['cached']} "
+            f"computed={result['computed']} elapsed={result['elapsed']:.1f}s"
+        )
+        st.session_state["heat_result"] = result
+        st.session_state["heat_ctx"] = {
+            "strategy": strategy_name, "symbol": symbol,
+            "x_param": x_param, "y_param": y_param, "metric": metric,
+            "x_range": x_range, "y_range": y_range,
+        }
+
+    if "heat_result" not in st.session_state:
+        return
+    result = st.session_state["heat_result"]
+    ctx = st.session_state["heat_ctx"]
+    # 用户中途改了指标 → 用新值
+    metric = ctx["metric"]
+
+    # 把 results dict → pivot DataFrame
+    from heatmap.runner import _frange as _fr, _round as _rd
+    x_meta = heatmap_param_meta(ctx["strategy"], ctx["x_param"])
+    y_meta = heatmap_param_meta(ctx["strategy"], ctx["y_param"])
+    x_vals = _fr(ctx["x_range"][0], ctx["x_range"][1], ctx["x_range"][2])
+    y_vals = _fr(ctx["y_range"][0], ctx["y_range"][1], ctx["y_range"][2])
+    # 应用 fast<slow 约束 (与 runner 一致)
+    if ctx["strategy"] == "macd" and "fast" in (ctx["x_param"], ctx["y_param"]) and "slow" in (ctx["x_param"], ctx["y_param"]):
+        fast_p = "fast" if ctx["x_param"] == "fast" else ctx["y_param"]
+        slow_p = "slow" if "slow" in (ctx["x_param"], ctx["y_param"]) else None
+        # 重排
+        all_combos = _enum(ctx["strategy"], ctx["x_param"], ctx["y_param"],
+                           ctx["x_range"], ctx["y_range"])
+    else:
+        all_combos = _enum(ctx["strategy"], ctx["x_param"], ctx["y_param"],
+                           ctx["x_range"], ctx["y_range"])
+
+    # 矩阵 (y 行 × x 列)
+    x_step = ctx["x_range"][2]
+    y_step = ctx["y_range"][2]
+    matrix = []
+    annotations = []
+    best_score = None
+    best_combo = None
+    for yv in y_vals:
+        row = []
+        for xv in x_vals:
+            params = {ctx["x_param"]: _rd(xv, x_step), ctx["y_param"]: _rd(yv, y_step)}
+            from heatmap.runner import _param_combo_key
+            key = _param_combo_key(params)
+            summary = result["results"].get(key)
+            if summary is None:
+                row.append(None)
+                annotations.append("")
+            else:
+                score = summary.get(metric, 0)
+                # max_drawdown_pct 越小越好，其它越大越好
+                if metric == "max_drawdown_pct":
+                    score = -abs(score)  # 转成越大越好（绝对值越小分越高）
+                row.append(score)
+                annotations.append(f"{score:.2f}")
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_combo = params
+        matrix.append(row)
+
+    # 转 numpy 给 plotly
+    arr = np.array([[v if v is not None else np.nan for v in row] for row in matrix])
+
+    # 选 colorscale
+    if metric == "max_drawdown_pct":
+        # 绿=小回撤=好, 红=大回撤=差 → 但我们 score 是 -abs(dd)，所以数值大=好
+        colorscale = "RdYlGn"
+    else:
+        colorscale = "RdYlGn"  # 红=低 绿=高
+
+    fig = go.Figure(data=go.Heatmap(
+        z=arr,
+        x=[_rd(x, x_step) for x in x_vals],
+        y=[_rd(y, y_step) for y in y_vals],
+        colorscale=colorscale,
+        text=annotations,
+        texttemplate="%{text}",
+        textfont={"size": 10},
+        colorbar=dict(title=OPTIMIZE_METRICS.get(metric, metric)),
+        hovertemplate=f"{ctx['x_param']}=%{{x}}<br>{ctx['y_param']}=%{{y}}<br>"
+                      f"{OPTIMIZE_METRICS.get(metric, metric)}=%{{z:.3f}}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"{ctx['strategy'].upper()} | {ctx['symbol']} | {OPTIMIZE_METRICS.get(metric, metric)}",
+        xaxis_title=f"{ctx['x_param']} ({heatmap_param_meta(ctx['strategy'], ctx['x_param'])['label']})",
+        yaxis_title=f"{ctx['y_param']} ({heatmap_param_meta(ctx['strategy'], ctx['y_param'])['label']})",
+        height=600,
+        margin=dict(l=70, r=20, t=60, b=50),
+    )
+    # 翻转 y 让小值在下
+    fig.update_yaxes(autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 最优参数
+    if best_combo:
+        st.success(
+            f"🏆 最优: **{best_combo}** | {OPTIMIZE_METRICS.get(metric, metric)} = "
+            f"**{best_score:.4f}**"
+        )
+        # 表格 — top 10
+        flat = []
+        for combo_key, summary in result["results"].items():
+            if summary is None:
+                continue
+            score = summary.get(metric, 0)
+            if metric == "max_drawdown_pct":
+                score = -abs(score)
+            flat.append((combo_key, score, summary))
+        flat.sort(key=lambda x: x[1], reverse=True)
+        st.markdown("#### Top 10 参数组合")
+        top_rows = []
+        for combo_key, score, summary in flat[:10]:
+            top_rows.append({
+                "参数": combo_key,
+                OPTIMIZE_METRICS.get(metric, metric): f"{score:.4f}",
+                "收益率%": f"{summary.get('profit_pct', 0):.2f}",
+                "夏普": f"{summary.get('sharpe_ratio', 0):.2f}",
+                "回撤%": f"{summary.get('max_drawdown_pct', 0):.2f}",
+                "胜率%": f"{summary.get('win_rate', 0):.1f}",
+                "交易数": summary.get("trade_count", summary.get("trades") and len(summary["trades"]) or 0),
+            })
+        st.dataframe(pd.DataFrame(top_rows), use_container_width=True, hide_index=True)
+
+
 def page_history():
     """回测历史 — 表格/趋势图/加载/导出。"""
     st.header("🗂️ 回测历史")
@@ -3054,6 +3304,7 @@ _PAGE_ROUTER = {
     PAGE_HISTORY: page_history,
     PAGE_WATCHLIST: page_watchlist,
     PAGE_RISK: page_risk_metrics,
+    PAGE_HEATMAP: page_param_heatmap,
 }
 
 
