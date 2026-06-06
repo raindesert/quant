@@ -49,3 +49,6 @@ Thumbs.db
 presets/*.yaml
 params/*.json
 reports/
+data/history.db
+data/history.db-wal
+data/history.db-shm

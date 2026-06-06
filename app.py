@@ -280,15 +280,17 @@ def metric_card(col, label, value, fmt=".2f", suffix="", is_pct=False):
 # ============== 回测历史 (v6 新增) ==============
 
 HISTORY_KEY = "backtest_history"
-HISTORY_MAX = 50  # 最多保存多少条
+HISTORY_MAX = 500  # session 内缓存上限 (持久化上限见 history_store._DEFAULT_LIMIT)
+_PERSIST_LOAD_ONCE = "_history_loaded"
 
 
 def _history_add(summary: dict, mode: str = "backtest", extra: dict | None = None):
-    """把一次回测结果追加到 session_state 历史。
+    """把一次回测结果追加到 session_state 历史 + 持久化到 SQLite。
 
+    SQLite 是唯一真源 (auto-increment id), session_state 只是 UI 缓存。
     每条记录 = {
-        "id": int (递增),
-        "timestamp": ISO 字符串,
+        "id": int (SQLite AUTOINCREMENT),
+        "timestamp": 'YYYY-MM-DD HH:MM:SS',
         "mode": str,
         "symbol": str,
         "strategy": str,
@@ -301,10 +303,10 @@ def _history_add(summary: dict, mode: str = "backtest", extra: dict | None = Non
         "extra": dict (子策略列表等),
     }
     """
-    history = st.session_state.setdefault(HISTORY_KEY, [])
-    next_id = max((h["id"] for h in history), default=0) + 1
+    import history_store  # 延迟 import, 避免 streamlit cold start 路径外的问题
+    new_id = history_store.save(mode, summary, extra)
     record = {
-        "id": next_id,
+        "id": new_id,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": mode,
         "symbol": summary.get("symbol", "?"),
@@ -317,19 +319,41 @@ def _history_add(summary: dict, mode: str = "backtest", extra: dict | None = Non
         "summary": summary,
         "extra": extra or {},
     }
+    history = st.session_state.setdefault(HISTORY_KEY, [])
     history.append(record)
-    # 超过上限，删最旧（FIFO）
+    # 超过 session 上限, 删最旧 (持久化层有自己的 FIFO, 见 history_store._enforce_cap)
     if len(history) > HISTORY_MAX:
         history.pop(0)
 
 
 def _history_remove(record_id: int):
+    import history_store
+    history_store.delete(record_id)
     history = st.session_state.get(HISTORY_KEY, [])
     st.session_state[HISTORY_KEY] = [h for h in history if h["id"] != record_id]
 
 
 def _history_clear():
+    import history_store
+    history_store.clear()
     st.session_state[HISTORY_KEY] = []
+
+
+def _history_load_all():
+    """从 SQLite 加载最新 N 条到 session_state。每个 session 只执行一次。"""
+    if st.session_state.get(_PERSIST_LOAD_ONCE):
+        return
+    try:
+        import history_store
+        history_store.init_db()
+        records = history_store.list_recent(limit=HISTORY_MAX)
+        st.session_state[HISTORY_KEY] = records
+        st.session_state[_PERSIST_LOAD_ONCE] = True
+    except Exception as e:
+        # 持久化失败不能阻塞 UI, 降级为内存模式
+        st.session_state.setdefault(HISTORY_KEY, [])
+        st.session_state[_PERSIST_LOAD_ONCE] = True
+        st.warning(f"⚠️ 回测历史持久化层加载失败: {e} (本次 session 使用临时内存)")
 
 
 def build_risk_manager(risk_enabled, max_position_pct, max_positions, max_drawdown_pct, max_daily_loss_pct, max_stock_loss_pct):
@@ -2914,6 +2938,66 @@ def page_history():
                 st.rerun()
 
     st.markdown("---")
+
+    # ============== 跨 session 统计 (持久化) ==============
+    st.subheader("📊 跨 Session 统计 (来自 SQLite 持久化)")
+    try:
+        import history_store
+        history_store.init_db()
+        agg = history_store.stats()
+    except Exception as e:
+        st.error(f"读取持久化统计失败: {e}")
+        agg = None
+
+    if agg and agg.get("total", 0) > 0:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("总记录数", agg["total"])
+        c2.metric("股票数", agg["distinct_symbols"])
+        c3.metric("策略数", agg["distinct_strategies"])
+        c4.metric("盈利占比", f"{agg['profitable']/agg['total']*100:.0f}%",
+                  help=f"{agg['profitable']} / {agg['total']}")
+        c5.metric("平均收益", f"{agg['avg_profit_pct']:+.2f}%")
+
+        if agg.get("best"):
+            b = agg["best"]
+            w = agg["worst"]
+            st.markdown(
+                f"**最佳:** #{b['id']} {b['symbol']}/{b['strategy']} "
+                f"{b['profit_pct']:+.2f}% @ {b['timestamp']}  \n"
+                f"**最差:** #{w['id']} {w['symbol']}/{w['strategy']} "
+                f"{w['profit_pct']:+.2f}% @ {w['timestamp']}"
+            )
+
+        # 同 symbol 聚合
+        sym_agg: dict = {}
+        for h in history:
+            s = h["symbol"]
+            if s not in sym_agg:
+                sym_agg[s] = {"n": 0, "profits": [], "best_pct": -1e9, "worst_pct": 1e9, "last_ts": ""}
+            e = sym_agg[s]
+            e["n"] += 1
+            e["profits"].append(h["profit_pct"])
+            e["best_pct"] = max(e["best_pct"], h["profit_pct"])
+            e["worst_pct"] = min(e["worst_pct"], h["profit_pct"])
+            if h["timestamp"] > e["last_ts"]:
+                e["last_ts"] = h["timestamp"]
+        if sym_agg:
+            rows = []
+            for sym, e in sorted(sym_agg.items(), key=lambda kv: -max(kv[1]["profits"])):
+                avg = sum(e["profits"]) / len(e["profits"])
+                rows.append({
+                    "股票": sym,
+                    "次数": e["n"],
+                    "平均收益%": f"{avg:+.2f}",
+                    "最佳%": f"{e['best_pct']:+.2f}",
+                    "最差%": f"{e['worst_pct']:+.2f}",
+                    "最近一次": e["last_ts"],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("无跨 session 统计 (数据库为空或不可用)")
+
+    st.markdown("---")
     if st.button("🗑️ 清空所有历史", key="hist_clear", type="secondary"):
         _history_clear()
         st.success("已清空")
@@ -3309,6 +3393,7 @@ _PAGE_ROUTER = {
 
 
 def main():
+    _history_load_all()  # 持久化: 从 SQLite 恢复跨 session 的回测历史
     page = render_sidebar()
     handler = _PAGE_ROUTER.get(page)
     if handler is None:

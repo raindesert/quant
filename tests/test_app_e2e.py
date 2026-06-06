@@ -366,6 +366,63 @@ class TestAppPages(unittest.TestCase):
         self._run_page(self.app.PAGE_HISTORY)
         self.assertIn("回测历史", self.rec.headers[0])
 
+    def test_page_history_persistence_roundtrip(self):
+        """v40: 端到端验证 _history_add 写 SQLite + 跨 session 统计展示。
+
+        Bug 修复前的盲区: page_history 跨 session 统计块 (SQLite stats) 之前
+        没有任何测试覆盖, 错 DB 路径 (history_store.py 用了 parent.parent
+        跳到 /work/) 一直没被发现。
+        """
+        import history_store
+        history_store.init_db()
+        history_store.clear()
+        # 重置 sqlite_sequence 让 id 从 1 开始
+        conn = history_store._connect()
+        try:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='backtest_runs'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.rec.session_state[self.app.HISTORY_KEY] = []
+        self.rec.session_state.state.pop(self.app._PERSIST_LOAD_ONCE, None)
+
+        # 1) _history_add 写 SQLite + session_state
+        self.app._history_add({
+            "profit_pct": 5.0, "symbol": "000001.SZ", "strategy": "sma",
+            "sharpe_ratio": 1.0, "max_drawdown_pct": -1.0, "win_rate": 80.0, "trades": 3,
+        })
+        self.app._history_add({
+            "profit_pct": -2.0, "symbol": "600000.SH", "strategy": "rsi",
+            "sharpe_ratio": -0.5, "max_drawdown_pct": -3.0, "win_rate": 30.0, "trades": 2,
+        })
+
+        # 2) session_state 有 2 条, id 从 1 起
+        h = self.rec.session_state[self.app.HISTORY_KEY]
+        self.assertEqual(len(h), 2)
+        self.assertEqual([r["id"] for r in h], [1, 2])
+        self.assertEqual([r["profit_pct"] for r in h], [5.0, -2.0])
+
+        # 3) SQLite 也有 2 条 (持久化生效)
+        self.assertEqual(history_store.stats()["total"], 2)
+
+        # 4) 跑 page_history 验证跨 session 统计块渲染出来
+        self._run_page(self.app.PAGE_HISTORY)
+        self.assertIn("回测历史", self.rec.headers[0])
+        # "跨 Session 统计" 标题应该出现 (持久化层起作用)
+        all_text = "\n".join(self.rec.headers + self.rec.subheaders)
+        self.assertIn("跨 Session 统计", all_text)
+
+        # 5) _history_remove 后 SQLite + session_state 同步
+        self.app._history_remove(1)
+        self.assertEqual(history_store.stats()["total"], 1)
+        self.assertEqual(len(self.rec.session_state[self.app.HISTORY_KEY]), 1)
+        self.assertEqual(self.rec.session_state[self.app.HISTORY_KEY][0]["id"], 2)
+
+        # 6) _history_clear 后两边都空
+        self.app._history_clear()
+        self.assertEqual(history_store.stats()["total"], 0)
+        self.assertEqual(self.rec.session_state[self.app.HISTORY_KEY], [])
+
     def test_page_watchlist(self):
         """端到端跑 page_watchlist。空 + 非空两种情况。
         注意：page_watchlist 内部读 _WATCHLIST_PATH（app.py 启动时绑定）。
@@ -480,8 +537,21 @@ class TestHistoryManager(unittest.TestCase):
         cls.app = app
 
     def setUp(self):
-        # 重置
+        # 重置: 必须彻底清 DB (AUTOINCREMENT counter 也要归零, 单纯 DELETE 不会)
+        # + 清 session_state 缓存, 否则跨 test id 漂移
+        import history_store
+        history_store.init_db()
+        history_store.clear()
+        # AUTOINCREMENT 归零: 删表重建
+        conn = history_store._connect()
+        try:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='backtest_runs'")
+            conn.commit()
+        finally:
+            conn.close()
         self.rec.session_state[self.app.HISTORY_KEY] = []
+        # fake _FakeSession 不支持 del/pop, 直接操作底层 dict
+        self.rec.session_state.state.pop(self.app._PERSIST_LOAD_ONCE, None)
 
     def test_history_add_assigns_incrementing_id(self):
         self.app._history_add({"profit_pct": 1.0, "symbol": "X", "strategy": "sma"})
