@@ -432,7 +432,7 @@ def run_backtest(args, config, logger):
                     if result is not None:
                         results_map[(symbol, s)] = result
                 except Exception as exc:
-                    pass
+                    logger.warning("回测任务失败 %s/%s: %s", symbol, s, exc)
                 if done % 10 == 0 or done == len(tasks):
                     print(f"  进度: {done}/{len(tasks)}", flush=True)
         elapsed = time.time() - t0
@@ -523,7 +523,7 @@ def run_backtest(args, config, logger):
         print(f"批量回测: {len(symbols)} 只股票 (并发执行)")
         print(f"{'=' * 50}")
         t0 = time.time()
-        tasks = [(strategy_name, s, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params) for s in symbols]
+        tasks = [(strategy_name, s, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params, getattr(args, "frequency", "day")) for s in symbols]
         with ProcessPoolExecutor(max_workers=min(8, len(symbols))) as executor:
             futures = [executor.submit(_run_single_backtest, t) for t in tasks]
             for future in as_completed(futures):
@@ -531,8 +531,8 @@ def run_backtest(args, config, logger):
                     summary = future.result()
                     if summary:
                         results.append(summary)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("回测任务失败: %s", exc)
         elapsed = time.time() - t0
         print(f"  完成，耗时 {elapsed:.1f}s\n")
     else:
@@ -706,7 +706,7 @@ def run_multi_strategy(args, config, logger):
         return
 
     days = args.days or backtest_config.get("days", 250)
-    initial_cash = backtest_config.get("initial_cash", 1_000_000)
+    initial_cash = config.get("initial_cash", 1_000_000)
     commission = backtest_config.get("commission", 0.0003)
     position_size = args.position_size if args.position_size is not None else 1.0
     stop_loss = args.stop_loss or 0.0

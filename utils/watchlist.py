@@ -21,8 +21,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# 默认存储位置（用户 home 目录）
-DEFAULT_PATH = Path.home() / ".quant_watchlist.json"
+# 默认存储位置（用户 home 目录；可用环境变量 QUANT_WATCHLIST_PATH 覆盖，
+# 便于测试重定向到临时目录，避免污染真实自选数据）
+DEFAULT_PATH = Path(
+    os.environ.get("QUANT_WATCHLIST_PATH")
+    or (Path.home() / ".quant_watchlist.json")
+)
 
 # A股代码格式校验（深圳 6 开头 .SZ / 上海 6 开头 .SH）
 _SYMBOL_RE = re.compile(r"^(?:\d{6})\.(?:SZ|SH)$")

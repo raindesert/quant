@@ -7,6 +7,7 @@ v2 重构：原实现按 symbol 分表，导致 1000+ 只股票时 sqlite_master
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -52,7 +53,10 @@ class DataCache:
 
     def __init__(self, db_dir: str | Path | None = None):
         if db_dir is None:
-            db_dir = Path.home() / ".quant" / "cache"
+            # 可用环境变量 QUANT_CACHE_DIR 覆盖（便于测试/便携部署）
+            db_dir = os.environ.get("QUANT_CACHE_DIR") or (
+                Path.home() / ".quant" / "cache"
+            )
         self.db_path = Path(db_dir) / "market.db"
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)

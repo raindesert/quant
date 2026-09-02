@@ -49,3 +49,4 @@ Thumbs.db
 presets/*.yaml
 params/*.json
 reports/
+.quant_cache/

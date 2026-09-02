@@ -107,7 +107,7 @@ class MultiStrategyEngine:
         self.take_profit = take_profit
         self.position_size = position_size
         self.weights = list(weights)
-        self.strategy_params = strategy_params or [{}] * len(strategies)
+        self.strategy_params = strategy_params or [{} for _ in strategies]
         if len(self.strategy_params) != len(strategies):
             raise ValueError("strategy_params 长度必须与 strategies 一致")
         self.start_date = start_date
@@ -253,16 +253,17 @@ class MultiStrategyEngine:
         if len(daily_ret) == 0 or daily_ret.std() == 0:
             sharpe = 0.0
         else:
-            sharpe = float(daily_ret.mean() / daily_ret.std() * (252 ** 0.5))
+            # 与 BaseBacktestEngine 一致，年化因子使用 244 个交易日
+            sharpe = float(daily_ret.mean() / daily_ret.std() * (244 ** 0.5))
 
-        # 最大回撤
+        # 最大回撤（取绝对值，与 BaseBacktestEngine 的正数口径一致）
         running_max = combined_equity.cummax()
         drawdown = (combined_equity - running_max) / running_max
-        max_dd = float(drawdown.min() * 100)
+        max_dd = float(abs(drawdown.min()) * 100)
 
-        # 年化
-        n_days = (combined_equity.index[-1] - combined_equity.index[0]).days or 1
-        annual_return = ((final / initial) ** (365.0 / n_days) - 1) * 100
+        # 年化（按交易日计，与 BaseBacktestEngine._calc_annual_return 口径一致）
+        years = len(combined_equity) / 244
+        annual_return = ((final / initial) ** (1 / years) - 1) * 100 if years > 0 and initial > 0 and final > 0 else 0.0
 
         # 交易次数（加权求和）
         total_trades = sum(int(r.get("trades", 0)) for r in valid)

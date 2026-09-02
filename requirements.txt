@@ -5,3 +5,4 @@ pyyaml>=6.0
 matplotlib>=3.7.0
 streamlit>=1.30.0
 plotly>=5.15.0
+optuna>=3.0.0
