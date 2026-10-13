@@ -123,7 +123,10 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 bar = self._row_to_bar(row, symbol=sym)
                 bars[sym] = bar
                 self.last_prices[sym] = bar["close"]
-                self.last_bars[sym] = bar
+                # 注意：此处不要把当日 bar 写入 last_bars。
+                # 涨跌停判定依赖 _get_prev_close() 读取「上一交易日」收盘价，
+                # 若提前写入当日 bar，会退化成 open >= 当日close * (1+阈值) 的错误比较。
+                # last_bars 统一在本日信号执行完毕后再更新（见下方）。
 
                 if benchmark_shares[sym] == 0 and di == 0:
                     open_p = bar["open"]
@@ -149,6 +152,11 @@ class PortfolioBacktestEngine(BaseBacktestEngine):
                 if sym in bars:
                     signal = self.pending_signal.pop(sym)
                     self._execute_signal(signal, bars[sym], strategies[sym])
+
+            # 本日信号已按「上一交易日收盘价」判定完毕，此时才更新 last_bars，
+            # 保证下一交易日的涨跌停判定拿到的是正确的昨收。
+            for sym, bar in bars.items():
+                self.last_bars[sym] = bar
 
             actions = {}
             for sym, bar in bars.items():

@@ -211,10 +211,13 @@ class MultiStrategyEngine:
                 "n_strategies": 0,
             }
 
-        # 每个子策略的 equity_curve 转 Series（按日期）
+        # 权重必须按 self.strategies 的原始下标取，不能按策略名反查：
+        #  - 子策略名与 self.strategies 不一致时会直接 KeyError；
+        #  - 同名策略（如 ["sma","sma"]）按名映射会互相覆盖、权重错配。
         series_list = []
         valid_names = []
-        for r in valid:
+        valid_idx = []
+        for i, r in enumerate(valid):
             eq_df = pd.DataFrame(r["equity_curve"])
             if "date" in eq_df.columns:
                 eq_df["date"] = pd.to_datetime(eq_df["date"])
@@ -222,10 +225,20 @@ class MultiStrategyEngine:
             s = eq_df["value"].astype(float)
             series_list.append(s)
             valid_names.append(r["strategy"])
+            valid_idx.append(i)
 
-        # 权重对应（用 self.strategies 顺序）
-        name_to_weight = dict(zip(self.strategies, self.weights))
-        valid_weights = np.array([name_to_weight[n] for n in valid_names])
+        # 只在名称能对上时用 self.strategies 的位置，否则退回等权
+        matched = []
+        for i, r in enumerate(valid):
+            try:
+                matched.append(self.strategies.index(r["strategy"]))
+            except ValueError:
+                matched = []
+                break
+        if matched and max(matched) < len(self.weights):
+            valid_weights = np.array([self.weights[i] for i in matched], dtype=float)
+        else:
+            valid_weights = np.ones(len(valid), dtype=float)
 
         # 归一化（万一有的子策略有 error）
         valid_weights = valid_weights / valid_weights.sum()
@@ -236,9 +249,23 @@ class MultiStrategyEngine:
             combined_index = combined_index.union(s.index)
         combined_index = combined_index.sort_values()
 
+        # 列名带下标，保证同名策略也能各自成列（同名会互相覆盖）
         aligned = pd.DataFrame(
-            {n: s.reindex(combined_index).ffill() for n, s in zip(valid_names, series_list)}
+            {f"{pos}:{name}": s.reindex(combined_index).ffill().bfill()
+             for pos, (name, s) in enumerate(zip(valid_names, series_list))}
         )
+
+        # 子策略起始日不一致时前导仍是 NaN（bfill 也救不回超出自身区间的点），
+        # 直接 dropna，否则 profit_pct / drawdown / sharpe 会整体变 NaN 且不报错。
+        before_drop = len(aligned)
+        aligned = aligned.dropna(how="any")
+        if len(aligned) == 0:
+            raise ValueError("各子策略权益曲线没有任何重叠日期，无法组合")
+        if len(aligned) < before_drop:
+            logger.warning(
+                "子策略权益曲线日期区间不一致，已丢弃前 %d 个无重叠交易日",
+                before_drop - len(aligned),
+            )
 
         # 加权求和：组合权益 = Σ weight_i * sub_strategy_equity_i
         combined_equity = (aligned * valid_weights).sum(axis=1)

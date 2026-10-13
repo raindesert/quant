@@ -1380,8 +1380,8 @@ def _render_quote_detail(quote: dict):
     c4.metric("最低", f"{quote.get('low', 0):.2f}")
 
     c1, c2 = st.columns(2)
-    c1.metric("成交量", f"{quote.get('volume', 0):,.0f}")
-    c2.metric("成交额", f"{quote.get('amount', 0):,.0f}")
+    c1.metric("成交量(手)", f"{quote.get('volume', 0):,.0f}")
+    c2.metric("成交额(万元)", f"{quote.get('amount', 0):,.0f}")
 
     st.markdown("---")
     cols = st.columns(3)

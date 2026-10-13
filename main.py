@@ -274,6 +274,7 @@ def run_optimize(args, config, logger):
         metric=metric,
         workers=workers,
         risk_params=risk_params,
+        walk_forward=getattr(args, "optimize_walk_forward", False),
     )
 
     result = optimizer.optimize(
@@ -307,6 +308,8 @@ def run_optimize(args, config, logger):
             "metric": metric,
             "leaderboard": leaderboard,
         }
+        if result.get("walk_forward"):
+            output["walk_forward"] = result["walk_forward"]
         with open(args.output_json, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         logger.info("优化结果已导出: %s", args.output_json)
@@ -908,6 +911,11 @@ def main():
         help="random/bayesian 模式采样次数（grid 模式忽略）",
     )
     parser.add_argument("--load-params", action="store_true", help="加载已保存的最优参数（回测时自动加载 params/ 目录下对应参数）")
+    parser.add_argument(
+        "--optimize-walk-forward",
+        action="store_true",
+        help="优化后对最优参数做 Walk-Forward 样本外验证（防止把噪声拟合进去）",
+    )
 
     risk_group = parser.add_argument_group("风控参数")
     risk_group.add_argument("--no-risk", action="store_true", help="禁用风控模块")
@@ -924,6 +932,8 @@ def main():
     wf_group.add_argument("--wf-step-days", type=int, default=None, help="Walk-Forward 步进天数 (默认60)")
 
     args = parser.parse_args()
+    # 挂到 args 上：让 merge_config_with_args 能区分「用户未传」与「等于 argparse 默认值」
+    args._quant_parser = parser
     logger = setup_logger()
     config = load_config()
 

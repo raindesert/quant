@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -11,21 +12,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _run_in_subprocess(code: str) -> tuple[int, str, str]:
-    """在独立 python 进程里跑代码，避开测试间的 sys.modules 污染。"""
+    """在独立 python 进程里跑代码，避开测试间的 sys.modules 污染。
+
+    必须显式指定 encoding：Windows 中文环境下 subprocess 默认按 GBK 解码，
+    子进程若输出 UTF-8 中文会抛 UnicodeDecodeError，导致 stdout 变成 None。
+    """
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     r = subprocess.run(
         [sys.executable, "-c", code],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60, env=env,
     )
     return r.returncode, r.stdout, r.stderr
 
 
 def _run_in_subprocess_env(code: str, env: dict) -> tuple[int, str, str]:
     """在独立 python 进程里跑代码（用 os.environ 传 path 避免 % 格式化冲突）。"""
-    import os
-    full_env = {**os.environ, **env}
+    full_env = {**os.environ, "PYTHONIOENCODING": "utf-8", **env}
     r = subprocess.run(
         [sys.executable, "-c", code],
-        capture_output=True, text=True, timeout=60, env=full_env,
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60, env=full_env,
     )
     return r.returncode, r.stdout, r.stderr
 
@@ -37,7 +44,6 @@ class TestExportHtmlReport(unittest.TestCase):
     def test_basic_html_generated(self):
         # 不在 _run_in_subprocess 用 % 格式化（子代码内 % 会冲突），
         # 改成 os.environ 传 path
-        import os
         env = {"QUANT_ROOT": str(Path(__file__).resolve().parent.parent)}
         rc, out, err = _run_in_subprocess_env("""\
 import sys, os

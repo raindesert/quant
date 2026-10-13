@@ -50,3 +50,6 @@ presets/*.yaml
 params/*.json
 reports/
 .quant_cache/
+# 回测图表产物（历史误提交过 charts/ charts_v4/ charts_test/，此处停止继续跟踪）
+charts/
+charts_*/
