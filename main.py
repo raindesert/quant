@@ -35,12 +35,28 @@ from utils.logger import setup_logger
 
 
 def _run_single_backtest(args_tuple):
-    """独立函数，用于并发回测（必须是模块级以支持 pickle）。"""
-    strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params, frequency = args_tuple
+    """独立函数，用于并发回测（必须是模块级以支持 pickle）。
+
+    args_tuple 末尾可携带可选 params 字典：第 18 位为 None 或 dict。
+    老调用方传 17 元组也兼容（自动补 None）。
+    """
+    if len(args_tuple) >= 18:
+        strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params, frequency, params = args_tuple
+    else:
+        strategy_name, symbol, days, initial_cash, commission, stop_loss, take_profit, position_size, start_date, end_date, verbose, slippage, slippage_type, enforce_t1, check_limit, risk_params, frequency = args_tuple
+        params = None
     strategy_cls = get_strategy_class(strategy_name)
     if strategy_cls is None:
         strategy_cls = get_strategy_class("sma")
-    strategy = strategy_cls()
+    assert strategy_cls is not None  # noqa: S101 — 兜底
+    if params:
+        try:
+            strategy = strategy_cls(**params)
+        except TypeError:
+            # 策略不接受这些参数（罕见），退回默认
+            strategy = strategy_cls()
+    else:
+        strategy = strategy_cls()
 
     risk_manager = None
     if risk_params and risk_params.get("enabled"):

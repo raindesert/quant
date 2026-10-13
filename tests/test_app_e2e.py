@@ -366,6 +366,63 @@ class TestAppPages(unittest.TestCase):
         self._run_page(self.app.PAGE_HISTORY)
         self.assertIn("回测历史", self.rec.headers[0])
 
+    def test_page_history_persistence_roundtrip(self):
+        """v40: 端到端验证 _history_add 写 SQLite + 跨 session 统计展示。
+
+        Bug 修复前的盲区: page_history 跨 session 统计块 (SQLite stats) 之前
+        没有任何测试覆盖, 错 DB 路径 (history_store.py 用了 parent.parent
+        跳到 /work/) 一直没被发现。
+        """
+        import history_store
+        history_store.init_db()
+        history_store.clear()
+        # 重置 sqlite_sequence 让 id 从 1 开始
+        conn = history_store._connect()
+        try:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='backtest_runs'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.rec.session_state[self.app.HISTORY_KEY] = []
+        self.rec.session_state.state.pop(self.app._PERSIST_LOAD_ONCE, None)
+
+        # 1) _history_add 写 SQLite + session_state
+        self.app._history_add({
+            "profit_pct": 5.0, "symbol": "000001.SZ", "strategy": "sma",
+            "sharpe_ratio": 1.0, "max_drawdown_pct": -1.0, "win_rate": 80.0, "trades": 3,
+        })
+        self.app._history_add({
+            "profit_pct": -2.0, "symbol": "600000.SH", "strategy": "rsi",
+            "sharpe_ratio": -0.5, "max_drawdown_pct": -3.0, "win_rate": 30.0, "trades": 2,
+        })
+
+        # 2) session_state 有 2 条, id 从 1 起
+        h = self.rec.session_state[self.app.HISTORY_KEY]
+        self.assertEqual(len(h), 2)
+        self.assertEqual([r["id"] for r in h], [1, 2])
+        self.assertEqual([r["profit_pct"] for r in h], [5.0, -2.0])
+
+        # 3) SQLite 也有 2 条 (持久化生效)
+        self.assertEqual(history_store.stats()["total"], 2)
+
+        # 4) 跑 page_history 验证跨 session 统计块渲染出来
+        self._run_page(self.app.PAGE_HISTORY)
+        self.assertIn("回测历史", self.rec.headers[0])
+        # "跨 Session 统计" 标题应该出现 (持久化层起作用)
+        all_text = "\n".join(self.rec.headers + self.rec.subheaders)
+        self.assertIn("跨 Session 统计", all_text)
+
+        # 5) _history_remove 后 SQLite + session_state 同步
+        self.app._history_remove(1)
+        self.assertEqual(history_store.stats()["total"], 1)
+        self.assertEqual(len(self.rec.session_state[self.app.HISTORY_KEY]), 1)
+        self.assertEqual(self.rec.session_state[self.app.HISTORY_KEY][0]["id"], 2)
+
+        # 6) _history_clear 后两边都空
+        self.app._history_clear()
+        self.assertEqual(history_store.stats()["total"], 0)
+        self.assertEqual(self.rec.session_state[self.app.HISTORY_KEY], [])
+
     def test_page_watchlist(self):
         """端到端跑 page_watchlist。空 + 非空两种情况。
         注意：page_watchlist 内部读 _WATCHLIST_PATH（app.py 启动时绑定）。
@@ -426,6 +483,46 @@ class TestAppPages(unittest.TestCase):
         self._run_page(self.app.PAGE_RISK)
         self.assertIn("风险分析", self.rec.headers[0])
 
+    def test_page_heatmap_idle(self):
+        """空载：page_param_heatmap 走 early return。"""
+        self._run_page(self.app.PAGE_HEATMAP)
+        self.assertIn("参数热图", self.rec.headers[0])
+
+    def test_page_heatmap_runs_grid(self):
+        """按下按钮 → 跑网格 + 渲染热图 + Top 10 表格。
+
+        用小网格 (3×3) 加快速度；用 SMA 简单策略。
+        """
+        # 注入 session_state 让 selectbox 选 SMA + 整数参数
+        self.rec.session_state["heat_strategy"] = "sma"
+        self.rec.session_state["heat_x_param"] = "fast"
+        self.rec.session_state["heat_y_param"] = "slow"
+        self.rec.session_state["heat_days"] = 120
+        self.rec.session_state["heat_metric"] = "sharpe_ratio"
+        self.rec.session_state["heat_usecache"] = True
+        # slider 范围: fast 3-7 step 1 (5 个) × slow 10-20 step 5 (3 个) = 15 个
+        # slider 返回 tuple (default_min, default_max) → 我们用 monkey-patch 让 slider 返指定值
+        # 简单方案: patch 滑块的范围到最小 (1+1=2 个组合) 跑快
+        handler = self.app._PAGE_ROUTER[self.app.PAGE_HEATMAP]
+        # 强制让 page 跑
+        self.rec.session_state["heat_run"] = True
+        # monkey-patch slider 让 x/y 范围小: 2x2
+        from heatmap import runner as _hr
+        orig_enum = _hr.enumerate_grid
+        def small_enum(strategy, x_param, y_param, x_range, y_range):
+            # 强制用 SMA 3x2 = 6
+            return orig_enum(strategy, x_param, y_param, (3, 5, 1), (10, 15, 5))
+        _hr.enumerate_grid = small_enum
+        try:
+            try:
+                handler()
+            except Exception as exc:
+                self.fail(f"page_param_heatmap raised: {type(exc).__name__}: {exc}")
+        finally:
+            _hr.enumerate_grid = orig_enum
+        # 验证: 渲染了热图
+        self.assertIn("参数热图", self.rec.headers[0])
+
 
 class TestHistoryManager(unittest.TestCase):
     """测试 _history_add / _history_remove / _history_clear 的纯逻辑（不调 st UI）。"""
@@ -440,8 +537,21 @@ class TestHistoryManager(unittest.TestCase):
         cls.app = app
 
     def setUp(self):
-        # 重置
+        # 重置: 必须彻底清 DB (AUTOINCREMENT counter 也要归零, 单纯 DELETE 不会)
+        # + 清 session_state 缓存, 否则跨 test id 漂移
+        import history_store
+        history_store.init_db()
+        history_store.clear()
+        # AUTOINCREMENT 归零: 删表重建
+        conn = history_store._connect()
+        try:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='backtest_runs'")
+            conn.commit()
+        finally:
+            conn.close()
         self.rec.session_state[self.app.HISTORY_KEY] = []
+        # fake _FakeSession 不支持 del/pop, 直接操作底层 dict
+        self.rec.session_state.state.pop(self.app._PERSIST_LOAD_ONCE, None)
 
     def test_history_add_assigns_incrementing_id(self):
         self.app._history_add({"profit_pct": 1.0, "symbol": "X", "strategy": "sma"})
@@ -1248,19 +1358,35 @@ class TestAppRouter(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _install_fake_streamlit()
+        # 清除 app 及其依赖 (heatmap, main, strategy) — 保证重 import 时
+        # 不会用到上一次失败半挂的 module, _PAGE_ROUTER 不会少 PAGE_HEATMAP
+        cls._purged = {}
         for mod in list(sys.modules.keys()):
-            if mod == "app" or mod.startswith("app."):
+            if mod == "app" or mod.startswith(("app.", "heatmap.", "main", "strategy")):
+                # 先备份再删，tearDownClass 还原；否则后续测试重新 import
+                # strategy.examples.sma 会拿到全新的类对象，
+                # 与本轮之前 get_strategy_class() 返回的对象 is 比较不相等。
+                cls._purged[mod] = sys.modules[mod]
                 del sys.modules[mod]
         import app  # noqa: F401
         cls.app = app
 
+    @classmethod
+    def tearDownClass(cls):
+        # 还原本类删除的模块，避免污染同一进程内后续运行的测试
+        for mod in list(sys.modules.keys()):
+            if mod == "app" or mod.startswith(("app.", "heatmap.", "main", "strategy")):
+                del sys.modules[mod]
+        sys.modules.update(cls._purged)
+
     def test_router_has_all_pages(self):
-        self.assertEqual(len(self.app._PAGE_ROUTER), 10)
+        self.assertEqual(len(self.app._PAGE_ROUTER), 11)
         for page in [
             self.app.PAGE_BACKTEST, self.app.PAGE_COMPARISON, self.app.PAGE_OPTIMIZE,
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
             self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
             self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST, self.app.PAGE_RISK,
+            self.app.PAGE_HEATMAP,
         ]:
             self.assertIn(page, self.app._PAGE_ROUTER)
             self.assertTrue(callable(self.app._PAGE_ROUTER[page]))
@@ -1276,6 +1402,7 @@ class TestAppRouter(unittest.TestCase):
             self.app.PAGE_MULTI_STRATEGY, self.app.PAGE_YAML,
             self.app.PAGE_WALK_FORWARD, self.app.PAGE_REALTIME,
             self.app.PAGE_HISTORY, self.app.PAGE_WATCHLIST, self.app.PAGE_RISK,
+            self.app.PAGE_HEATMAP,
         ]
         self.assertEqual(len(consts), len(set(consts)))
 
