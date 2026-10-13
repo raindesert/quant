@@ -20,11 +20,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger("quant")
+
 
 SUPPORTED_FORMATS = ("yaml", "yml", "json")
+
+# 哨兵：表示「取不到 argparse 默认值」，避免和任何真实值误判相等
+_NO_DEFAULT = object()
 
 # 允许的顶层字段（其他字段警告但不报错）
 ALLOWED_KEYS = {
@@ -97,8 +103,11 @@ def load_config(path: str | Path) -> dict[str, Any]:
             f"配置根必须是 dict，实际是 {type(data).__name__}"
         )
 
-    # 警告未知字段（不阻断）
-    _check_unknown_keys(data)
+    # 警告未知字段（不阻断）。
+    # 早前返回值被直接丢弃，用户把 stop_loss 拼错成 stoplos 也会完全静默不生效。
+    unknown = _check_unknown_keys(data)
+    if unknown:
+        logger.warning("配置中存在未知字段（将被忽略）: %s", ", ".join(unknown))
 
     return data
 
@@ -152,8 +161,25 @@ def merge_config_with_args(
             setattr(args, key, value)
         elif isinstance(current, list) and not current and isinstance(value, list):
             setattr(args, key, value)
+        elif current == _argparse_default(args, key):
+            # current 等于 argparse 的默认值，说明用户没有显式传这个参数，
+            # 而是有默认值的参数（如 --strategy 默认 "sma"、--slippage-type 默认 "percent"）
+            # 之前会被当成"CLI 已设置"而静默压过 YAML 配置，文档却引导用户这样写。
+            setattr(args, key, value)
 
     return args
+
+
+def _argparse_default(args: Any, key: str) -> Any:
+    """取 argparse 里该参数的原始默认值；取不到返回哨兵对象（不会误判相等）。"""
+    parser = getattr(args, "_quant_parser", None)
+    if parser is None:
+        return _NO_DEFAULT
+    try:
+        action = next((a for a in parser._actions if a.dest == key), None)
+    except Exception:
+        return _NO_DEFAULT
+    return action.default if action is not None else _NO_DEFAULT
 
 
 def example_config() -> str:

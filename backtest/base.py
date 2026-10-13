@@ -371,9 +371,14 @@ class BaseBacktestEngine:
             monthly[month_key]["end"] = e["value"]
 
         result = {}
+        prev_end = None
         for month, data in monthly.items():
-            if data["start"] > 0:
-                result[month] = (data["end"] - data["start"]) / data["start"] * 100
+            # 月度收益的分母应是上月最后一个权益点（含跨月缺口），
+            # 若直接用当月首日权益值，当月第一天的涨跌会被漏掉，月度序列系统性偏低。
+            start_value = data["start"] if prev_end is None else prev_end
+            if start_value and start_value > 0:
+                result[month] = (data["end"] - start_value) / start_value * 100
+            prev_end = data["end"]
         return result
 
     def _calc_quantile_stats(self) -> dict:
@@ -411,13 +416,45 @@ class BaseBacktestEngine:
                 # 兼容旧 trade 数据（未拆分 stamp_cost）
                 st = t["price"] * t["quantity"] * self.stamp_tax
             total_stamp_tax += st
+
+        # 按 FIFO 预计算每笔 SELL 对应的买入端佣金（engine/portfolio 的 SELL
+        # 记录不保存 entry_commission，这里从真实 BUY 记录配对，避免估值手续费）
+        entry_commissions = {}
+        open_lots = {}
+        for t in self.trades:
+            sym = t["symbol"]
+            if t["action"] == "BUY":
+                open_lots.setdefault(sym, []).append(
+                    [t.get("quantity", 0), t.get("commission_cost", 0.0)]
+                )
+            elif t["action"] == "SELL":
+                remain = t.get("quantity", 0)
+                acc = 0.0
+                lots = open_lots.get(sym, [])
+                while remain > 0 and lots:
+                    lot = lots[0]
+                    take = min(remain, lot[0])
+                    if lot[0] <= 0:
+                        lots.pop(0)
+                        continue
+                    acc += lot[1] * (take / lot[0]) if lot[0] else 0.0
+                    lot[0] -= take
+                    lot[1] *= 1 - (take / (lot[0] + take))
+                    remain -= take
+                    if lot[0] <= 0:
+                        lots.pop(0)
+                entry_commissions[sym] = entry_commissions.get(sym, 0.0) + acc
+
         for t in sell_trades:
             entry_price = t.get("entry_price", 0.0)
             cc = t.get("commission_cost", 0.0)
             st = t.get("stamp_cost", 0.0)
             if st == 0:
                 st = t["price"] * t["quantity"] * self.stamp_tax
-            pnl = (t["price"] - entry_price) * t["quantity"] - cc - st
+            # 买入端佣金也要计入单笔盈亏，否则短周期策略的胜率/盈利因子被系统性高估。
+            # SELL 记录里没有 entry_commission 字段，这里按 FIFO 从真实 BUY 记录里取。
+            entry_cc = entry_commissions.get(t["symbol"], 0.0)
+            pnl = (t["price"] - entry_price) * t["quantity"] - cc - st - entry_cc
             if pnl > 0:
                 win_trades += 1
                 total_profit += pnl

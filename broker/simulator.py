@@ -53,6 +53,12 @@ class SimulatorBroker:
         return True
 
     def sell(self, symbol: str, price: float, quantity: int, timestamp: datetime = None) -> bool:
+        # 必须与 buy() 一样先按整手取整并挡掉非正数量：
+        # 否则 sell(sym, p, -100) 会让 positions 增加 100 股（凭空造股），
+        # 因为 positions < -100 不成立，负成交额还会反向污染 cash。
+        quantity = (quantity // 100) * 100
+        if quantity <= 0:
+            return False
         if self.positions.get(symbol, 0) < quantity:
             return False
 

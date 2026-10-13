@@ -1,6 +1,8 @@
 """事件驱动回测引擎 - 支持止损/止盈、仓位管理、A股真实佣金。"""
 from __future__ import annotations
 
+from typing import Any
+
 import pandas as pd
 
 from backtest.base import BaseBacktestEngine
@@ -110,13 +112,30 @@ class BacktestEngine(BaseBacktestEngine):
         symbol: str,
         enforce_t1: bool | None = None,
         check_limit: bool | None = None,
+        trade_start: Any = None,
     ) -> dict | None:
         # 允许调用方临时覆盖 T+1 / 涨跌停
+        # 用局部变量承接，避免就地改实例属性后不还原（同实例后续回测会静默失效）
+        prev_t1 = self.enforce_t_plus_1
+        prev_limit = self.check_limit
         if enforce_t1 is not None:
             self.enforce_t_plus_1 = enforce_t1
         if check_limit is not None:
             self.check_limit = check_limit
+        try:
+            return self._run_loop(strategy, df, symbol, trade_start)
+        finally:
+            # 无论是否抛异常都还原实例开关
+            self.enforce_t_plus_1 = prev_t1
+            self.check_limit = prev_limit
 
+    def _run_loop(
+        self,
+        strategy,
+        df: pd.DataFrame,
+        symbol: str,
+        trade_start: Any = None,
+    ) -> dict | None:
         self.reset()
 
         strategy.on_init({"symbol": symbol, "days": len(df)})
@@ -126,6 +145,21 @@ class BacktestEngine(BaseBacktestEngine):
             return None
 
         warmup_count = min(20, len(bars) - 1)
+
+        # trade_start：Walk-Forward 等场景下，前置若干 bar 只用于预热指标
+        # （喂给策略算 MA/RSI），从该日期开始才允许交易与计入统计。
+        # 这样窗口长度就不必为预热期额外缩短。
+        trade_start_idx = 0
+        if trade_start is not None:
+            start_ts = pd.to_datetime(trade_start)
+            for idx, row in enumerate(bars):
+                if pd.Timestamp(row.date) >= start_ts:
+                    trade_start_idx = idx
+                    break
+            else:
+                trade_start_idx = len(bars)
+            # 交易起点必须落在预热区之后
+            trade_start_idx = max(trade_start_idx, warmup_count)
 
         first_bar = self._row_to_bar(bars[0], symbol)
         self.last_prices[symbol] = first_bar["close"]
@@ -145,7 +179,7 @@ class BacktestEngine(BaseBacktestEngine):
             self.last_prices[symbol] = current_bar["close"]
             self.last_bars[symbol] = current_bar
 
-            if benchmark_shares == 0:
+            if benchmark_shares == 0 and i >= trade_start_idx:
                 open_price = current_bar["open"]
                 cost_per_100 = self._calc_buy_cost(open_price, 100)
                 affordable = int(self.initial_cash * 0.5 / cost_per_100) * 100
@@ -154,30 +188,34 @@ class BacktestEngine(BaseBacktestEngine):
                     benchmark_cash -= cost
                     benchmark_shares = affordable
             benchmark_value = benchmark_cash + benchmark_shares * current_bar["close"]
-            self.benchmark_curve.append({"date": current_bar["date"], "value": benchmark_value})
+            if i >= trade_start_idx:
+                self.benchmark_curve.append({"date": current_bar["date"], "value": benchmark_value})
 
-            self._check_stop_loss(symbol, next_bar["open"], self.pending_signal)
-            self._check_take_profit(symbol, next_bar["open"], self.pending_signal)
+            if i >= trade_start_idx:
+                self._check_stop_loss(symbol, next_bar["open"], self.pending_signal)
+                self._check_take_profit(symbol, next_bar["open"], self.pending_signal)
 
-            if symbol in self.pending_signal:
-                signal = self.pending_signal.pop(symbol)
-                self._execute_signal(signal, next_bar, strategy)
+                if symbol in self.pending_signal:
+                    signal = self.pending_signal.pop(symbol)
+                    self._execute_signal(signal, next_bar, strategy)
 
+            # 预热期也要喂 bar 给策略，让 MA/RSI 等指标成形，但产生的信号不建仓
             signal = strategy.on_bar(current_bar)
-            if signal != Signal.HOLD:
+            if signal != Signal.HOLD and i >= trade_start_idx:
                 self.pending_signal[symbol] = signal
 
-            total_value = self.get_total_value()
-            self.equity_curve.append({"date": current_bar["date"], "value": total_value, "action": self._last_action})
-            self._last_action = None
+            if i >= trade_start_idx:
+                total_value = self.get_total_value()
+                self.equity_curve.append({"date": current_bar["date"], "value": total_value, "action": self._last_action})
+                self._last_action = None
 
-            if self.risk_manager is not None:
-                self.risk_manager.update_portfolio_state(
-                    total_value=total_value,
-                    positions=self.positions,
-                    last_prices=self.last_prices,
-                    date=current_bar["date"],
-                )
+                if self.risk_manager is not None:
+                    self.risk_manager.update_portfolio_state(
+                        total_value=total_value,
+                        positions=self.positions,
+                        last_prices=self.last_prices,
+                        date=current_bar["date"],
+                    )
 
         last_bar = self._row_to_bar(bars[-1], symbol)
         self.last_prices[symbol] = last_bar["close"]

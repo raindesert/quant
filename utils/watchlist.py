@@ -15,11 +15,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("quant")
 
 # 默认存储位置（用户 home 目录；可用环境变量 QUANT_WATCHLIST_PATH 覆盖，
 # 便于测试重定向到临时目录，避免污染真实自选数据）
@@ -30,6 +33,36 @@ DEFAULT_PATH = Path(
 
 # A股代码格式校验（深圳 6 开头 .SZ / 上海 6 开头 .SH）
 _SYMBOL_RE = re.compile(r"^(?:\d{6})\.(?:SZ|SH)$")
+
+
+def _backup_corrupt(path: Path) -> None:
+    """把损坏的 JSON 文件备份为 <path>.corrupt，尽量保住用户原始数据。"""
+    try:
+        backup = path.with_suffix(path.suffix + ".corrupt")
+        os.replace(path, backup)
+    except OSError as exc:
+        logger.warning("备份损坏文件失败 %s: %s", path, exc)
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """原子写 JSON：先写同目录临时文件再 os.replace 覆盖。
+
+    直接 open(path,"w") 截断后写入，进程崩溃/断电会留下半截 JSON，
+    而读取方会把损坏当空列表，用户自选股就被下一次保存覆盖清空。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -60,9 +93,11 @@ def is_valid_symbol(symbol: str) -> bool:
 
 
 def load_watchlist(path: Path | str = DEFAULT_PATH) -> list[dict[str, Any]]:
-    """加载自选列表。如果文件不存在或损坏，返回空列表。
+    """加载自选列表。如果文件不存在，返回空列表。
 
-    自动过滤掉无效/禁用项（默认启用）。调用方可自行决定如何处理 enabled 字段。
+    文件损坏时先备份为 .corrupt 再返回空列表并告警——注意不能静默返回空列表：
+    调用方（add_stock/remove_stock）会把它当成"用户本来就没有自选"，
+    下一次保存就会用 1 条记录覆盖掉原文件，导致自选股被不可逆清空。
     """
     path = Path(path)
     if not path.exists():
@@ -70,7 +105,12 @@ def load_watchlist(path: Path | str = DEFAULT_PATH) -> list[dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        _backup_corrupt(path)
+        logger.warning("自选股文件已损坏，已备份为 %s.corrupt，本次按空列表处理", path)
+        return []
+    except OSError as exc:
+        logger.warning("读取自选股文件失败 %s: %s", path, exc)
         return []
     if not isinstance(data, dict):
         return []
@@ -112,8 +152,7 @@ def save_watchlist(stocks: list[dict[str, Any]],
             continue
         clean.append(s)
     data = {"version": 1, "stocks": clean, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(path, data)
 
 
 def add_stock(symbol: str, name: str = "", tags: list[str] | None = None,

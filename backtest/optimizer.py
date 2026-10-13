@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from enum import Enum
 from itertools import product
@@ -11,6 +12,8 @@ from typing import Any, Callable
 
 from backtest.engine import BacktestEngine
 from strategy.registry import STRATEGY_REGISTRY, get_strategy_class
+
+logger = logging.getLogger("quant")
 
 
 DEFAULT_GRIDS = {
@@ -160,6 +163,8 @@ class StrategyOptimizer:
         stop_loss: float = 0.0,
         take_profit: float = 0.0,
         position_size: float = 1.0,
+        slippage: float = 0.0,
+        slippage_type: str = "percent",
         start_date: str | None = None,
         end_date: str | None = None,
         metric: str = "sharpe_ratio",
@@ -174,6 +179,8 @@ class StrategyOptimizer:
         self.stop_loss = stop_loss
         self.take_profit = take_profit
         self.position_size = position_size
+        self.slippage = slippage
+        self.slippage_type = slippage_type
         self.start_date = start_date
         self.end_date = end_date
         self.metric = metric
@@ -222,7 +229,7 @@ class StrategyOptimizer:
         if self.risk_params and self.risk_params.get("enabled"):
             print(f"风控: 已启用")
         if self.walk_forward:
-            print(f"Walk-Forward: 已启用（将在验证期评估稳健性）")
+            print("Walk-Forward: 已启用（将在最优参数上做样本外验证）")
 
         args_list = [
             (
@@ -242,7 +249,62 @@ class StrategyOptimizer:
         ]
 
         all_results = self._run_concurrent(args_list, total)
-        return self._summarize(all_results)
+        summary = self._summarize(all_results)
+
+        if self.walk_forward and summary.get("best_params"):
+            summary["walk_forward"] = self._validate_walk_forward(
+                summary["best_params"],
+                candidates=all_results,
+            )
+
+        return summary
+
+    def _validate_walk_forward(
+        self,
+        best_params: dict,
+        candidates: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        """对最优参数做样本外 Walk-Forward 验证。
+
+        优化是在全样本上搜出来的，必须用滚动窗口检验其稳健性，
+        否则只是把噪声拟合得更好。返回各窗口统计与过拟合判定。
+        """
+        from backtest.walk_forward import WalkForwardValidator
+
+        validator = WalkForwardValidator(
+            strategy_name=self.strategy_name,
+            symbol=self.symbol,
+            commission=self.commission,
+            stop_loss=self.stop_loss,
+            take_profit=self.take_profit,
+            position_size=self.position_size,
+            slippage=self.slippage,
+            slippage_type=self.slippage_type,
+            strategy_params=best_params,
+        )
+        wf = validator.validate()
+
+        print(f"\n{'=' * 60}")
+        print("Walk-Forward 样本外验证（最优参数）")
+        print(f"{'=' * 60}")
+        print(wf.summary())
+
+        if wf.is_overfit:
+            logger.warning(
+                "最优参数在样本外验证中衰减严重（衰减比 %.2f），可能过拟合，建议缩小参数搜索范围或加入正则约束",
+                wf.degradation_ratio,
+            )
+
+        return {
+            "avg_train_return": wf.avg_train_return,
+            "avg_test_return": wf.avg_test_return,
+            "avg_train_sharpe": wf.avg_train_sharpe,
+            "avg_test_sharpe": wf.avg_test_sharpe,
+            "degradation_ratio": wf.degradation_ratio,
+            "is_overfit": wf.is_overfit,
+            "skipped_windows": wf.skipped_windows,
+            "n_windows": len(wf.windows),
+        }
 
     def _optimize_search(
         self,
@@ -319,6 +381,13 @@ class StrategyOptimizer:
         summary = self._summarize(all_results)
         summary["n_trials"] = len(all_results)
         summary["n_pruned"] = len(all_results) - len(valid)
+
+        if self.walk_forward and summary.get("best_params"):
+            summary["walk_forward"] = self._validate_walk_forward(
+                summary["best_params"],
+                candidates=all_results,
+            )
+
         return summary
 
     def _run_concurrent(self, args_list: list, total: int) -> list[dict]:
@@ -336,8 +405,10 @@ class StrategyOptimizer:
                     print(f"  [{i}/{total}] {params_str} → {score_str}")
                 except Exception as e:
                     args = futures[future]
-                    all_results.append({"params": args[-1], "error": str(e)})
-                    print(f"  [{i}/{total}] {args[-1]} → ERROR: {e}")
+                    # 元组末位是 risk_params，参数在倒数第二位；
+                    # 早前误用 args[-1] 会把整个风控字典当成 params 上报。
+                    all_results.append({"params": args[-2], "error": str(e)})
+                    print(f"  [{i}/{total}] {args[-2]} → ERROR: {e}")
         return all_results
 
     def _summarize(self, all_results: list[dict]) -> dict[str, Any]:

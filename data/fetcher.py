@@ -22,6 +22,21 @@ from data.cache import DataCache
 logger = logging.getLogger("quant")
 
 
+def _adjust_base_of(df: pd.DataFrame) -> str | None:
+    """取数据中最新交易日作为前复权基标识。
+
+    两个数据源都是 qfq 前复权，序列会在每次分红送转后重定基；
+    用最新日期做基标识，基变化时缓存层会重建该 symbol，避免
+    除权日出现虚假跳空污染 pct_change 和全部技术指标。
+    """
+    if df is None or df.empty or "date" not in df.columns:
+        return None
+    try:
+        return pd.to_datetime(df["date"].max()).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
 class DataFetcher:
     """获取历史行情与实时行情，支持本地SQLite缓存。"""
 
@@ -50,6 +65,16 @@ class DataFetcher:
             )
             for key in sorted_keys[: len(sorted_keys) - cls._MAX_CACHE_ENTRIES]:
                 del cls._history_cache[key]
+
+    @staticmethod
+    def _calendar_days(trading_days: int) -> int:
+        """把「交易日」换算成回推所需的自然日天数。
+
+        之前三处都直接用 trading_days 当自然日，导致 days=250 只能覆盖约 170 个
+        交易日，且 len(df) >= days*0.6 的门槛仍会被满足，于是静默少拿数据不报错。
+        A股一年约 244 个交易日、365 个自然日，约 1.5 倍换算（再留 10% 冗余）。
+        """
+        return max(int(trading_days * 1.5 * 1.1), trading_days + 1)
 
     @staticmethod
     def _to_tencent_symbol(symbol: str) -> str:
@@ -100,7 +125,7 @@ class DataFetcher:
             # 本地缓存只存日线（分钟数据量太大）
             df = self._try_incremental_fetch(symbol, days)
             if not df.empty and len(df) >= days * 0.6:
-                self._local_cache.save(symbol, df)
+                self._local_cache.save(symbol, df, adjust_base=_adjust_base_of(df))
                 with self._cache_lock:
                     self._history_cache[cache_key] = (df.copy(), now)
                     self._trim_cache()
@@ -111,7 +136,7 @@ class DataFetcher:
                 df = self._fetch_from_baostock(symbol, days)
                 if not df.empty and len(df) >= days * 0.6:
                     if self._local_cache is not None:
-                        self._local_cache.save(symbol, df)
+                        self._local_cache.save(symbol, df, adjust_base=_adjust_base_of(df))
                     with self._cache_lock:
                         self._history_cache[cache_key] = (df.copy(), now)
                         self._trim_cache()
@@ -138,7 +163,7 @@ class DataFetcher:
             df = self._local_cache.load(symbol)
             if not df.empty:
                 logger.info("使用本地缓存数据: %s (%d条)", symbol, len(df))
-                cutoff = df["date"].max() - pd.Timedelta(days=days)
+                cutoff = df["date"].max() - pd.Timedelta(days=self._calendar_days(days))
                 df = df[df["date"] >= cutoff].reset_index(drop=True)
                 with self._cache_lock:
                     self._history_cache[cache_key] = (df.copy(), now)
@@ -154,7 +179,7 @@ class DataFetcher:
         if last_date_str is None:
             return pd.DataFrame()
 
-        start_dt = datetime.now() - timedelta(days=days)
+        start_dt = datetime.now() - timedelta(days=self._calendar_days(days))
         cached_df = self._local_cache.load(symbol, start_date=start_dt.strftime("%Y-%m-%d"))
         if cached_df.empty:
             return pd.DataFrame()
@@ -183,6 +208,10 @@ class DataFetcher:
             combined = pd.concat([cached_df, new_df], ignore_index=True)
             combined = combined.drop_duplicates(subset=["date"], keep="last")
             combined = combined.sort_values("date").reset_index(drop=True)
+            # 缓存陈旧时 incremental_days 可能远大于本次请求的 days，
+            # 不截断会让 get_history(days=30) 返回数百根 bar、回测区间被静默放大。
+            if len(combined) > days:
+                combined = combined.tail(days).reset_index(drop=True)
             return combined
 
         return cached_df
@@ -200,7 +229,7 @@ class DataFetcher:
                 bs.login()
                 code = self._to_baostock_code(symbol)
                 end_date = datetime.now().strftime("%Y-%m-%d")
-                start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+                start_date = (datetime.now() - timedelta(days=self._calendar_days(days))).strftime("%Y-%m-%d")
 
                 rs = bs.query_history_k_data_plus(
                     code,
@@ -335,7 +364,7 @@ class DataFetcher:
                 注意腾讯 API 的分钟数据最多只能查最近 ~5 个交易日。
         """
         end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=self._calendar_days(days))).strftime("%Y-%m-%d")
         params = {"param": f"{symbol},{frequency},{start_date},{end_date},{days},qfq"}
 
         max_retries = 3
@@ -419,7 +448,10 @@ class DataFetcher:
                 "change": change,
                 "change_pct": change_pct,
                 "volume": float(fields[6]),
-                "amount": float(fields[38]) if len(fields) > 38 else 0.0,
+                # 腾讯行情字段：fields[37]=成交额(万元)、fields[38]=换手率(%)。
+                # 早前误用 fields[38]，导致"成交额"实际取到换手率百分比。
+                "amount": float(fields[37]) if len(fields) > 37 else 0.0,
+                "turnover_rate": float(fields[38]) if len(fields) > 38 else 0.0,
                 "date": current_time,
                 "timestamp": current_time,
             }

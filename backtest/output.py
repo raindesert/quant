@@ -35,6 +35,32 @@ _COLORS = {
 }
 
 
+def _fmt_trade_date(value) -> str:
+    """交易日期统一格式化为 YYYY-MM-DD，避免 datetime 原样渲染成带时分秒的长串。"""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value) if value is not None else ""
+
+
+def _fmt_num(value) -> str:
+    """数字统一保留 2 位小数，非数值原样返回。"""
+    if isinstance(value, (int, float)):
+        return f"{value:,.2f}"
+    return str(value) if value is not None else ""
+
+
+def _trade_amount(trade: dict) -> float:
+    """成交金额。引擎产出的字段是 price/quantity，没有 amount，缺失时现算。"""
+    if "amount" in trade:
+        return trade["amount"]
+    price = trade.get("price", 0) or 0
+    quantity = trade.get("quantity", 0) or 0
+    try:
+        return float(price) * float(quantity)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def export_trades_csv(trades: list[dict], path: str | Path):
     if not trades:
         return
@@ -495,11 +521,11 @@ def export_html_report(
         # 取前 50 条
         rows = trades[:50]
         rows_html = "\n".join(
-            f"<tr><td>{t.get('date', '')}</td>"
+            f"<tr><td>{_fmt_trade_date(t.get('date'))}</td>"
             f"<td>{t.get('action', '')}</td>"
-            f"<td>{t.get('price', '')}</td>"
-            f"<td>{t.get('shares', '')}</td>"
-            f"<td>{t.get('amount', '')}</td></tr>"
+            f"<td>{_fmt_num(t.get('price'))}</td>"
+            f"<td>{t.get('quantity', '')}</td>"
+            f"<td>{_fmt_num(_trade_amount(t))}</td></tr>"
             for t in rows
         )
         more = f'<p class="meta">（仅显示前 50 条，共 {len(trades)} 条）</p>' if len(trades) > 50 else ""
